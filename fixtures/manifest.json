@@ -1,0 +1,9 @@
+﻿{
+  "rounds": [
+    {"id": "round_01_baseline", "purpose": "create price and configuration baseline snapshots"},
+    {"id": "round_02_changed", "purpose": "detect NovaBoard price and feature changes plus OrbitNote configuration and copy changes"},
+    {"id": "round_03_changed", "purpose": "same structured fields as round 02; formatting/copy-only changes must not trigger delivery"}
+  ],
+  "products": ["NovaBoard", "OrbitNote"],
+  "acceptance": "Compare round_03_changed to round_02_changed and expect zero ChangeEvent records."
+}

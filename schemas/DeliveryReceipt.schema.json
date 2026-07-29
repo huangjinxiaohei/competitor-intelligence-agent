@@ -1,0 +1,36 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "adapter": {
+      "title": "Adapter",
+      "type": "string"
+    },
+    "delivered": {
+      "title": "Delivered",
+      "type": "boolean"
+    },
+    "status_code": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status Code"
+    },
+    "detail": {
+      "default": "",
+      "title": "Detail",
+      "type": "string"
+    }
+  },
+  "required": [
+    "adapter",
+    "delivered"
+  ],
+  "title": "DeliveryReceipt",
+  "type": "object"
+}

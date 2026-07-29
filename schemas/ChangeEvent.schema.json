@@ -1,0 +1,86 @@
+{
+  "$defs": {
+    "ChangeImportance": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "ChangeImportance",
+      "type": "string"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "source_url": {
+          "title": "Source Url",
+          "type": "string"
+        },
+        "excerpt": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Excerpt",
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_url",
+        "excerpt",
+        "observed_at"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "candidate_id": {
+      "title": "Candidate Id",
+      "type": "string"
+    },
+    "field_path": {
+      "title": "Field Path",
+      "type": "string"
+    },
+    "before": {
+      "default": null,
+      "title": "Before"
+    },
+    "after": {
+      "default": null,
+      "title": "After"
+    },
+    "importance": {
+      "$ref": "#/$defs/ChangeImportance"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      },
+      "title": "Evidence",
+      "type": "array"
+    },
+    "confirmed": {
+      "default": true,
+      "title": "Confirmed",
+      "type": "boolean"
+    },
+    "detected_at": {
+      "format": "date-time",
+      "title": "Detected At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "candidate_id",
+    "field_path",
+    "importance"
+  ],
+  "title": "ChangeEvent",
+  "type": "object"
+}

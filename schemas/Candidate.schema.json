@@ -1,0 +1,62 @@
+{
+  "$defs": {
+    "CandidateStatus": {
+      "enum": [
+        "monitored",
+        "pending",
+        "rejected"
+      ],
+      "title": "CandidateStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "minLength": 1,
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "homepage": {
+      "title": "Homepage",
+      "type": "string"
+    },
+    "category": {
+      "title": "Category",
+      "type": "string"
+    },
+    "score": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Score",
+      "type": "number"
+    },
+    "reasons": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Reasons",
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/CandidateStatus"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "homepage",
+    "category",
+    "score",
+    "reasons",
+    "status"
+  ],
+  "title": "Candidate",
+  "type": "object"
+}

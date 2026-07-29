@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "SourceType": {
+      "enum": [
+        "html",
+        "pdf",
+        "sitemap",
+        "fixture"
+      ],
+      "title": "SourceType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "candidate_id": {
+      "title": "Candidate Id",
+      "type": "string"
+    },
+    "url": {
+      "title": "Url",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "fetched_at": {
+      "format": "date-time",
+      "title": "Fetched At",
+      "type": "string"
+    },
+    "content_hash": {
+      "minLength": 16,
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "source_type": {
+      "$ref": "#/$defs/SourceType"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    }
+  },
+  "required": [
+    "candidate_id",
+    "url",
+    "title",
+    "fetched_at",
+    "content_hash",
+    "source_type",
+    "text"
+  ],
+  "title": "SourceDocument",
+  "type": "object"
+}

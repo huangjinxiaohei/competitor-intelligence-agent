@@ -1,0 +1,203 @@
+{
+  "$defs": {
+    "AdapterSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "search": {
+          "default": "host",
+          "title": "Search",
+          "type": "string"
+        },
+        "analyzer": {
+          "default": "heuristic",
+          "title": "Analyzer",
+          "type": "string"
+        },
+        "delivery": {
+          "default": "mock",
+          "title": "Delivery",
+          "type": "string"
+        }
+      },
+      "title": "AdapterSettings",
+      "type": "object"
+    },
+    "CollectionSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "timeout_seconds": {
+          "default": 20,
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "retries": {
+          "default": 3,
+          "minimum": 0,
+          "title": "Retries",
+          "type": "integer"
+        },
+        "per_domain_delay_seconds": {
+          "default": 1.0,
+          "minimum": 0,
+          "title": "Per Domain Delay Seconds",
+          "type": "number"
+        },
+        "max_pdf_megabytes": {
+          "default": 20,
+          "minimum": 1,
+          "title": "Max Pdf Megabytes",
+          "type": "integer"
+        },
+        "browser_fallback": {
+          "default": true,
+          "title": "Browser Fallback",
+          "type": "boolean"
+        }
+      },
+      "title": "CollectionSettings",
+      "type": "object"
+    },
+    "DiscoverySettings": {
+      "additionalProperties": false,
+      "properties": {
+        "auto_monitor_threshold": {
+          "default": 0.75,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Auto Monitor Threshold",
+          "type": "number"
+        },
+        "pending_threshold": {
+          "default": 0.45,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Pending Threshold",
+          "type": "number"
+        },
+        "max_candidates": {
+          "default": 20,
+          "minimum": 1,
+          "title": "Max Candidates",
+          "type": "integer"
+        },
+        "max_monitored": {
+          "default": 10,
+          "minimum": 1,
+          "title": "Max Monitored",
+          "type": "integer"
+        },
+        "weights": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Weights",
+          "type": "object"
+        }
+      },
+      "title": "DiscoverySettings",
+      "type": "object"
+    },
+    "ProjectSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "topic": {
+          "title": "Topic",
+          "type": "string"
+        },
+        "keywords": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Keywords",
+          "type": "array"
+        },
+        "seed_urls": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Seed Urls",
+          "type": "array"
+        },
+        "output_language": {
+          "default": "zh-CN",
+          "title": "Output Language",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "topic",
+        "keywords"
+      ],
+      "title": "ProjectSettings",
+      "type": "object"
+    },
+    "ScheduleSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "timezone": {
+          "default": "Asia/Shanghai",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "daily_time": {
+          "default": "09:00",
+          "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$",
+          "title": "Daily Time",
+          "type": "string"
+        }
+      },
+      "title": "ScheduleSettings",
+      "type": "object"
+    },
+    "StorageSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "database": {
+          "default": "state/competitive_intel.db",
+          "title": "Database",
+          "type": "string"
+        },
+        "reports_dir": {
+          "default": "reports",
+          "title": "Reports Dir",
+          "type": "string"
+        }
+      },
+      "title": "StorageSettings",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "project": {
+      "$ref": "#/$defs/ProjectSettings"
+    },
+    "discovery": {
+      "$ref": "#/$defs/DiscoverySettings"
+    },
+    "collection": {
+      "$ref": "#/$defs/CollectionSettings"
+    },
+    "schedule": {
+      "$ref": "#/$defs/ScheduleSettings"
+    },
+    "adapters": {
+      "$ref": "#/$defs/AdapterSettings"
+    },
+    "storage": {
+      "$ref": "#/$defs/StorageSettings"
+    }
+  },
+  "required": [
+    "project"
+  ],
+  "title": "ProjectConfig",
+  "type": "object"
+}

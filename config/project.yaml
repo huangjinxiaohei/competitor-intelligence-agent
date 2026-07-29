@@ -1,0 +1,40 @@
+project:
+  id: agent-tools-demo
+  topic: Agent 工具与平台
+  keywords:
+    - agent platform
+    - agent builder
+    - agent automation pricing
+  seed_urls: []
+  output_language: zh-CN
+
+discovery:
+  auto_monitor_threshold: 0.75
+  pending_threshold: 0.45
+  max_candidates: 20
+  max_monitored: 10
+  weights:
+    feature_overlap: 0.40
+    audience_overlap: 0.25
+    business_model_overlap: 0.20
+    keyword_match: 0.15
+
+collection:
+  timeout_seconds: 20
+  retries: 3
+  per_domain_delay_seconds: 1
+  max_pdf_megabytes: 20
+  browser_fallback: true
+
+schedule:
+  timezone: Asia/Shanghai
+  daily_time: "09:00"
+
+adapters:
+  search: host
+  analyzer: heuristic
+  delivery: mock
+
+storage:
+  database: state/competitive_intel.db
+  reports_dir: reports

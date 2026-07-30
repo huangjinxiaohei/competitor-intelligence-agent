@@ -53,7 +53,8 @@ def test_build_digest_normalizes_url_names_and_bounds_card_fields(tmp_path) -> N
     )
     snap = snapshot().model_copy(
         update={
-            "features": [f"feature-{index}" for index in range(8)],
+            "summary": "s" * 300,
+            "features": ["f" * 200, *[f"feature-{index}" for index in range(7)]],
             "configurations": {f"key-{index}": f"value-{index}" for index in range(5)},
             "evidence": [
                 Evidence(source_url=f"https://acme.test/source-{index}", excerpt="fact", observed_at=NOW)
@@ -68,6 +69,10 @@ def test_build_digest_normalizes_url_names_and_bounds_card_fields(tmp_path) -> N
     assert len(digest.products[0].features) == 5
     assert len(digest.products[0].configurations) == 3
     assert len(digest.products[0].evidence_urls) == 2
+    assert len(digest.products[0].summary) == 240
+    assert digest.products[0].summary.endswith("\u2026")
+    assert len(digest.products[0].features[0]) == 120
+    assert digest.products[0].features[0].endswith("\u2026")
 
 
 def test_write_reports_writes_full_markdown_json_and_csv(tmp_path) -> None:

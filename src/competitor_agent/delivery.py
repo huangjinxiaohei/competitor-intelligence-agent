@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Protocol
 
@@ -17,13 +18,6 @@ class DeliveryAdapter(Protocol):
         """Publish ``digest`` and always return a receipt."""
 
 
-def _change_line(change: ChangeEvent) -> str:
-    return (
-        f"**{change.candidate_id}** · `{change.field_path}`\n"
-        f"{change.before!s} → {change.after!s} ({change.importance.value})"
-    )
-
-
 _UNKNOWN = "\u6682\u672a\u8bc6\u522b"
 _HOME_URL_TOO_LONG = "\u4e3b\u9875\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a"
 _EVIDENCE_URL_TOO_LONG = "\u8bc1\u636e\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a"
@@ -31,7 +25,8 @@ _MAX_TITLE_LENGTH = 64
 _MAX_SUMMARY_LENGTH = 200
 _MAX_REPORT_PATH_LENGTH = 128
 _MAX_NAME_LENGTH = 40
-_MAX_URL_LENGTH = 64
+_MAX_URL_LENGTH = 512
+_MAX_PAYLOAD_BYTES = 19_500
 _MAX_FEATURE_LENGTH = 32
 _MAX_CONFIG_KEY_LENGTH = 16
 _MAX_CONFIG_VALUE_LENGTH = 32
@@ -120,6 +115,53 @@ def _change_line(change: ChangeEvent) -> str:
     )
 
 
+def _serialized_size(payload: dict) -> int:
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def _fit_link_budget(payload: dict, digest: Digest) -> None:
+    """Downgrade complete links only when the whole card exceeds its byte budget."""
+    if _serialized_size(payload) < _MAX_PAYLOAD_BYTES:
+        return
+
+    products = digest.products[:5]
+    replacements: list[tuple[int, str, str]] = []
+    for evidence_index in (1, 0):
+        for product_index, product in enumerate(products):
+            if evidence_index >= len(product.evidence_urls):
+                continue
+            url = product.evidence_urls[evidence_index]
+            if len(url) <= _MAX_URL_LENGTH:
+                label = f"\u6765\u6e90{evidence_index + 1}"
+                replacements.append(
+                    (
+                        product_index + 1,
+                        f"[{label}]({url})",
+                        _EVIDENCE_URL_TOO_LONG,
+                    )
+                )
+
+    for product_index, product in enumerate(products):
+        if len(product.homepage) <= _MAX_URL_LENGTH:
+            name = _truncate(product.name, _MAX_NAME_LENGTH)
+            replacements.append(
+                (
+                    product_index + 1,
+                    f"### [{name}]({product.homepage})",
+                    f"### {name}\n{_HOME_URL_TOO_LONG}",
+                )
+            )
+
+    for element_index, link, fallback in replacements:
+        element = payload["card"]["elements"][element_index]
+        content = element["content"]
+        if link not in content:
+            continue
+        element["content"] = content.replace(link, fallback, 1)
+        if _serialized_size(payload) < _MAX_PAYLOAD_BYTES:
+            return
+
+
 def render_payload(digest: Digest) -> dict:
     """Render a portable interactive-card payload for common bot webhooks.
 
@@ -148,7 +190,7 @@ def render_payload(digest: Digest) -> dict:
             "content": f"\u672c\u5730\u5b8c\u6574\u62a5\u544a\uFF1A{_truncate(digest.report_path, _MAX_REPORT_PATH_LENGTH)}",
         }
     )
-    return {
+    payload = {
         "msg_type": "interactive",
         "card": {
             "header": {
@@ -158,6 +200,8 @@ def render_payload(digest: Digest) -> dict:
             "elements": elements,
         },
     }
+    _fit_link_budget(payload, digest)
+    return payload
 
 
 class MockDeliveryAdapter:

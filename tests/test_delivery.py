@@ -205,9 +205,12 @@ def test_render_payload_stays_under_twenty_kilobytes_for_unbounded_digest_inputs
         }
     )
 
-    serialized = json.dumps(render_payload(digest), ensure_ascii=False).encode("utf-8")
+    payload = render_payload(digest)
+    serialized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    http_body = httpx.Request("POST", "https://webhook.test", json=payload).content
 
     assert len(serialized) < 20_000
+    assert len(http_body) < 20_000
 
 
 def test_render_payload_never_truncates_a_long_url_into_a_link() -> None:
@@ -227,6 +230,61 @@ def test_render_payload_never_truncates_a_long_url_into_a_link() -> None:
     assert long_url not in text
     assert "\u8bc1\u636e\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a" in text
     assert "\u4e3b\u9875\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a" in text
+
+
+def test_render_payload_preserves_realistic_long_official_links_under_size_limit() -> None:
+    products: list[DigestProduct] = []
+    expected_urls: list[str] = []
+    for index in range(5):
+        homepage = (
+            f"https://official-{index}.example.test/products/agent-platform?"
+            f"campaign={'h' * 300}"
+        )
+        evidence_urls = [
+            (
+                f"https://docs-{index}.example.test/pricing/enterprise?"
+                f"region=global&source={'e' * 400}-{evidence_index}"
+            )
+            for evidence_index in range(2)
+        ]
+        expected_urls.extend([homepage, *evidence_urls])
+        products.append(
+            DigestProduct(
+                candidate_id=f"realistic-{index}",
+                name=f"Realistic product {index}",
+                homepage=homepage,
+                features=[f"feature {feature}" for feature in range(5)],
+                pricing=[
+                    PriceTier(
+                        name=f"Tier {tier}",
+                        amount=29 + tier,
+                        currency="USD",
+                        period="month",
+                        unit="user",
+                    )
+                    for tier in range(3)
+                ],
+                configurations={
+                    f"setting-{setting}": f"value-{setting}" for setting in range(3)
+                },
+                confidence=0.95,
+                evidence_urls=evidence_urls,
+            )
+        )
+
+    payload = render_payload(make_digest(5).model_copy(update={"products": products}))
+    card_text = "\n".join(
+        element.get("content", "") for element in payload["card"]["elements"]
+    )
+    serialized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    http_body = httpx.Request("POST", "https://webhook.test", json=payload).content
+
+    assert all(100 <= len(url) <= 500 for url in expected_urls)
+
+    assert len(serialized) < 20_000
+    assert len(http_body) < 20_000
+    for url in expected_urls:
+        assert f"]({url})" in card_text
 
 
 def test_mock_adapter_records_the_digest() -> None:

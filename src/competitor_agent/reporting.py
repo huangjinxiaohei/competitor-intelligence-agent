@@ -13,7 +13,7 @@ from .models import Candidate, ChangeEvent, Digest, DigestProduct, ProductSnapsh
 
 def _clip(value: object, limit: int) -> str:
     text = re.sub(r"\s+", " ", str(value)).strip()
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "?"
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
 def _display_name(candidate: Candidate) -> str:

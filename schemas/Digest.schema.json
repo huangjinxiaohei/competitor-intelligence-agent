@@ -57,6 +57,72 @@
       "title": "ChangeImportance",
       "type": "string"
     },
+    "DigestProduct": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "homepage": {
+          "title": "Homepage",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 5,
+          "title": "Features",
+          "type": "array"
+        },
+        "pricing": {
+          "items": {
+            "$ref": "#/$defs/PriceTier"
+          },
+          "maxItems": 3,
+          "title": "Pricing",
+          "type": "array"
+        },
+        "configurations": {
+          "additionalProperties": true,
+          "maxProperties": 3,
+          "title": "Configurations",
+          "type": "object"
+        },
+        "confidence": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "evidence_urls": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 2,
+          "title": "Evidence Urls",
+          "type": "array"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "name",
+        "homepage"
+      ],
+      "title": "DigestProduct",
+      "type": "object"
+    },
     "Evidence": {
       "additionalProperties": false,
       "properties": {
@@ -83,6 +149,77 @@
       ],
       "title": "Evidence",
       "type": "object"
+    },
+    "PriceTier": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "amount": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Amount"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "period": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Period"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "qualifiers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Qualifiers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "PriceTier",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -108,6 +245,14 @@
         "$ref": "#/$defs/ChangeEvent"
       },
       "title": "Changes",
+      "type": "array"
+    },
+    "products": {
+      "items": {
+        "$ref": "#/$defs/DigestProduct"
+      },
+      "maxItems": 5,
+      "title": "Products",
       "type": "array"
     },
     "failed_sources": {

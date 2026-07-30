@@ -123,12 +123,25 @@ class ChangeEvent(StrictModel):
     detected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class DigestProduct(StrictModel):
+    candidate_id: str
+    name: str
+    homepage: str
+    summary: str = ""
+    features: list[str] = Field(default_factory=list, max_length=5)
+    pricing: list[PriceTier] = Field(default_factory=list, max_length=3)
+    configurations: dict[str, Any] = Field(default_factory=dict, max_length=3)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    evidence_urls: list[str] = Field(default_factory=list, max_length=2)
+
+
 class Digest(StrictModel):
     run_id: str
     kind: str
     title: str
     summary: str
     changes: list[ChangeEvent] = Field(default_factory=list)
+    products: list[DigestProduct] = Field(default_factory=list, max_length=5)
     failed_sources: list[str] = Field(default_factory=list)
     report_path: str
 

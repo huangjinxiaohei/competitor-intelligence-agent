@@ -9,6 +9,8 @@ from competitor_agent.models import (
     ChangeEvent,
     ChangeImportance,
     Evidence,
+    Digest,
+    DigestProduct,
     PriceTier,
     ProductSnapshot,
 )
@@ -60,4 +62,37 @@ def test_change_event_keeps_source_evidence() -> None:
 
     assert event.confirmed is True
     assert event.evidence[0].source_url.endswith("/pricing")
+
+def test_digest_product_is_bounded_and_digest_defaults_remain_compatible() -> None:
+    product = DigestProduct(
+        candidate_id="candidate-1",
+        name="Acme",
+        homepage="https://acme.test",
+        summary="Agent workspace",
+        features=["automation"],
+        pricing=[PriceTier(name="Pro", amount=29, currency="USD", period="month")],
+        configurations={"deployment": "cloud"},
+        confidence=0.9,
+        evidence_urls=["https://acme.test/pricing"],
+    )
+    digest = Digest(
+        run_id="run-1",
+        kind="baseline",
+        title="Competitor baseline",
+        summary="One product",
+        report_path="reports/run-1.md",
+    )
+
+    assert product.pricing[0].amount == 29
+    assert digest.products == []
+
+    with pytest.raises(ValidationError):
+        Digest(
+            run_id="run-2",
+            kind="baseline",
+            title="Too many",
+            summary="Six products",
+            products=[product] * 6,
+            report_path="reports/run-2.md",
+        )
 

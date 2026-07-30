@@ -11,3 +11,4 @@ reports/
 playwright-report/
 .superpowers/
 
+.worktrees/

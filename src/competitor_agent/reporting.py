@@ -2,10 +2,59 @@ from __future__ import annotations
 
 import csv
 import json
+import re
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Iterable
 
-from .models import Candidate, ChangeEvent, Digest, ProductSnapshot
+from .models import Candidate, ChangeEvent, Digest, DigestProduct, ProductSnapshot
+
+
+
+def _clip(value: object, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "?"
+
+
+def _display_name(candidate: Candidate) -> str:
+    if candidate.name.startswith(("http://", "https://")):
+        hostname = urlsplit(candidate.homepage).hostname or candidate.name
+        return hostname.removeprefix("www.")
+    return _clip(candidate.name, 80)
+
+
+def _digest_products(
+    candidates: list[Candidate], snapshots: list[ProductSnapshot]
+) -> list[DigestProduct]:
+    snapshots_by_id = {item.candidate_id: item for item in snapshots}
+    products: list[DigestProduct] = []
+    for candidate in candidates:
+        snapshot = snapshots_by_id.get(candidate.id)
+        if snapshot is None:
+            continue
+        configurations = {
+            _clip(key, 60): _clip(value, 120)
+            for key, value in list(snapshot.configurations.items())[:3]
+        }
+        evidence_urls = list(
+            dict.fromkeys(item.source_url for item in snapshot.evidence)
+        )[:2]
+        products.append(
+            DigestProduct(
+                candidate_id=candidate.id,
+                name=_display_name(candidate),
+                homepage=candidate.homepage,
+                summary=_clip(snapshot.summary, 240),
+                features=[_clip(item, 120) for item in snapshot.features[:5]],
+                pricing=snapshot.pricing[:3],
+                configurations=configurations,
+                confidence=snapshot.confidence,
+                evidence_urls=evidence_urls,
+            )
+        )
+        if len(products) == 5:
+            break
+    return products
 
 
 def build_digest(
@@ -33,6 +82,7 @@ def build_digest(
         title=title,
         summary=summary,
         changes=change_list[:5],
+        products=_digest_products(candidate_list, snapshot_list),
         failed_sources=error_list,
         report_path=str(report_path),
     )

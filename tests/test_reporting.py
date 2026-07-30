@@ -17,6 +17,7 @@ def snapshot() -> ProductSnapshot:
         candidate_id="candidate-1",
         observed_at=NOW,
         summary="Agent workspace",
+        features=["workflow automation", "dashboards"],
         configurations={"deployment": "cloud"},
         specifications={"requests_per_month": 1000},
         pricing=[PriceTier(name="Pro", amount=29, currency="USD", period="month")],
@@ -38,6 +39,35 @@ def test_build_digest_labels_first_run_as_baseline_and_limits_message_changes(tm
     assert len(digest.changes) == 5
     assert digest.failed_sources == ["source failed"]
     assert digest.report_path.endswith("run-1.md")
+    assert len(digest.products) == 1
+    assert digest.products[0].name == "Acme"
+    assert digest.products[0].features == ["workflow automation", "dashboards"]
+    assert digest.products[0].pricing[0].name == "Pro"
+    assert digest.products[0].configurations == {"deployment": "cloud"}
+    assert digest.products[0].evidence_urls == ["https://acme.test/pricing"]
+
+
+def test_build_digest_normalizes_url_names_and_bounds_card_fields(tmp_path) -> None:
+    item = candidate().model_copy(
+        update={"name": "https://www.acme.test/pricing", "homepage": "https://www.acme.test/pricing"}
+    )
+    snap = snapshot().model_copy(
+        update={
+            "features": [f"feature-{index}" for index in range(8)],
+            "configurations": {f"key-{index}": f"value-{index}" for index in range(5)},
+            "evidence": [
+                Evidence(source_url=f"https://acme.test/source-{index}", excerpt="fact", observed_at=NOW)
+                for index in range(4)
+            ],
+        }
+    )
+
+    digest = build_digest("run-2", [item], [snap], [], [], tmp_path / "run-2.md", True)
+
+    assert digest.products[0].name == "acme.test"
+    assert len(digest.products[0].features) == 5
+    assert len(digest.products[0].configurations) == 3
+    assert len(digest.products[0].evidence_urls) == 2
 
 
 def test_write_reports_writes_full_markdown_json_and_csv(tmp_path) -> None:

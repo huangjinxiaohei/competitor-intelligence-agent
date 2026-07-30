@@ -1,9 +1,10 @@
-﻿from datetime import UTC, datetime
+﻿import json
+from datetime import UTC, datetime
 
 import httpx
 
 from competitor_agent.delivery import MockDeliveryAdapter, WebhookDeliveryAdapter, render_payload
-from competitor_agent.models import ChangeEvent, ChangeImportance, Digest
+from competitor_agent.models import ChangeEvent, ChangeImportance, Digest, DigestProduct, PriceTier
 
 
 def make_digest(change_count: int = 6) -> Digest:
@@ -23,6 +24,27 @@ def make_digest(change_count: int = 6) -> Digest:
         title="Competitor update",
         summary="Pricing and feature changes detected.",
         changes=changes,
+        products=[
+            DigestProduct(
+                candidate_id="acme-1",
+                name="Acme",
+                homepage="https://acme.test",
+                summary="Agent workspace",
+                features=["workflow automation", "dashboards"],
+                pricing=[
+                    PriceTier(
+                        name="Pro",
+                        amount=29,
+                        currency="USD",
+                        period="month",
+                        unit="user",
+                    )
+                ],
+                configurations={"deployment": "cloud"},
+                confidence=0.9,
+                evidence_urls=["https://acme.test/pricing"],
+            )
+        ],
         report_path="reports/run-001.md",
     )
 
@@ -32,13 +54,69 @@ def test_render_payload_is_collaboration_card_and_limits_changes() -> None:
 
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["title"]["content"] == "Competitor update"
-    assert len(payload["card"]["elements"]) == 7  # summary + five changes + report link
+    assert len(payload["card"]["elements"]) == 9  # summary + product + label + five changes + report link
     assert payload["card"]["elements"][0] == {
         "tag": "markdown",
         "content": "Pricing and feature changes detected.",
     }
-    assert "nova-0" in payload["card"]["elements"][1]["content"]
+    assert "nova-0" in payload["card"]["elements"][3]["content"]
     assert "nova-5" not in str(payload)
+    card_text = "\n".join(
+        element.get("content", "") for element in payload["card"]["elements"]
+    )
+    assert "Acme" in card_text
+    assert "workflow automation" in card_text
+    assert "Pro: USD 29/month/user" in card_text
+    assert "deployment=cloud" in card_text
+    assert "90%" in card_text
+    assert "https://acme.test/pricing" in card_text
+
+
+def test_render_payload_labels_missing_product_fields() -> None:
+    digest = make_digest(0).model_copy(
+        update={
+            "products": [
+                DigestProduct(
+                    candidate_id="empty-1",
+                    name="Empty",
+                    homepage="https://empty.test",
+                    confidence=0.0,
+                )
+            ]
+        }
+    )
+
+    text = str(render_payload(digest))
+
+    assert text.count("\u6682\u672a\u8bc6\u522b") >= 3
+
+
+def test_render_payload_with_maximum_products_is_under_twenty_kilobytes() -> None:
+    products = [
+        DigestProduct(
+            candidate_id=f"product-{index}",
+            name=f"Product {index}",
+            homepage=f"https://product-{index}.test",
+            summary="Competitor overview",
+            features=[f"feature {feature}" for feature in range(5)],
+            pricing=[
+                PriceTier(name=f"Tier {tier}", amount=tier, currency="USD", period="month")
+                for tier in range(3)
+            ],
+            configurations={f"setting-{setting}": f"value-{setting}" for setting in range(3)},
+            confidence=0.95,
+            evidence_urls=[
+                f"https://product-{index}.test/evidence-{evidence}"
+                for evidence in range(2)
+            ],
+        )
+        for index in range(5)
+    ]
+    digest = make_digest(0).model_copy(update={"products": products})
+
+    serialized = json.dumps(render_payload(digest), ensure_ascii=False).encode("utf-8")
+
+    assert len(serialized) < 20_000
 
 
 def test_mock_adapter_records_the_digest() -> None:

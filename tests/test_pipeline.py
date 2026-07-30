@@ -55,6 +55,9 @@ def test_fixture_pipeline_baseline_change_and_no_change_rounds(tmp_path: Path) -
     assert baseline.digest is not None and baseline.digest.kind == "baseline"
     assert baseline.delivery is not None and baseline.delivery.delivered
     assert baseline.snapshot_count == 2
+    assert len(baseline.digest.products) == 2
+    assert {product.name for product in baseline.digest.products} == {"NovaBoard", "OrbitNote"}
+    assert all(product.evidence_urls for product in baseline.digest.products)
 
     assert changed.status is RunStatus.SUCCESS
     assert changed.change_count >= 2

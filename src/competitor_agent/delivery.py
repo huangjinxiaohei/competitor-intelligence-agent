@@ -33,16 +33,16 @@ def render_payload(digest: Digest) -> dict:
     """
 
     elements: list[dict] = [
-        {"tag": "markdown", "text": {"content": digest.summary}},
+        {"tag": "markdown", "content": digest.summary},
     ]
     elements.extend(
-        {"tag": "markdown", "text": {"content": _change_line(change)}}
+        {"tag": "markdown", "content": _change_line(change)}
         for change in digest.changes[:5]
     )
     elements.append(
         {
             "tag": "markdown",
-            "text": {"content": f"Report: `{digest.report_path}`"},
+            "content": f"Report: `{digest.report_path}`",
         }
     )
     return {

@@ -33,7 +33,11 @@ def test_render_payload_is_collaboration_card_and_limits_changes() -> None:
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["title"]["content"] == "Competitor update"
     assert len(payload["card"]["elements"]) == 7  # summary + five changes + report link
-    assert "nova-0" in payload["card"]["elements"][1]["text"]["content"]
+    assert payload["card"]["elements"][0] == {
+        "tag": "markdown",
+        "content": "Pricing and feature changes detected.",
+    }
+    assert "nova-0" in payload["card"]["elements"][1]["content"]
     assert "nova-5" not in str(payload)
 
 

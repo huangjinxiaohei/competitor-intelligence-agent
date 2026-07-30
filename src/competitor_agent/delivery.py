@@ -25,19 +25,36 @@ def _change_line(change: ChangeEvent) -> str:
 
 
 _UNKNOWN = "\u6682\u672a\u8bc6\u522b"
-_MAX_NAME_LENGTH = 120
-_MAX_HOME_URL_LENGTH = 300
-_MAX_FEATURE_LENGTH = 120
-_MAX_CONFIG_KEY_LENGTH = 80
-_MAX_CONFIG_VALUE_LENGTH = 120
-_MAX_EVIDENCE_URL_LENGTH = 300
-_MAX_PRICE_PART_LENGTH = 100
+_HOME_URL_TOO_LONG = "\u4e3b\u9875\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a"
+_EVIDENCE_URL_TOO_LONG = "\u8bc1\u636e\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a"
+_MAX_TITLE_LENGTH = 64
+_MAX_SUMMARY_LENGTH = 200
+_MAX_REPORT_PATH_LENGTH = 128
+_MAX_NAME_LENGTH = 40
+_MAX_URL_LENGTH = 64
+_MAX_FEATURE_LENGTH = 32
+_MAX_CONFIG_KEY_LENGTH = 16
+_MAX_CONFIG_VALUE_LENGTH = 32
+_MAX_PRICE_NAME_LENGTH = 24
+_MAX_CURRENCY_LENGTH = 12
+_MAX_PERIOD_LENGTH = 12
+_MAX_UNIT_LENGTH = 12
+_MAX_CHANGE_ID_LENGTH = 36
+_MAX_CHANGE_FIELD_LENGTH = 36
+_MAX_CHANGE_VALUE_LENGTH = 48
 
 
 def _truncate(value: object, limit: int) -> str:
-    """Keep each visible field compact enough for webhook payload limits."""
+    """Keep descriptive text compact without modifying links."""
     text = str(value)
     return text if len(text) <= limit else f"{text[: limit - 1]}\u2026"
+
+
+def _display_url(url: str, label: str, too_long_copy: str) -> str:
+    """Return a complete Markdown link or a non-link fallback; never a partial URL."""
+    if len(url) > _MAX_URL_LENGTH:
+        return too_long_copy
+    return f"[{label}]({url})"
 
 
 def _price_text(product: DigestProduct) -> str:
@@ -46,15 +63,15 @@ def _price_text(product: DigestProduct) -> str:
 
     values: list[str] = []
     for tier in product.pricing:
-        amount = f"{tier.amount:g}" if tier.amount is not None else "\u8054\u7cfb\u9500\u552e"
-        value = (
-            f"{_truncate(tier.name, _MAX_PRICE_PART_LENGTH)}: "
-            f"{_truncate(tier.currency or '', _MAX_PRICE_PART_LENGTH)} {amount}"
-        ).replace("  ", " ").strip()
+        amount = f"{tier.amount:g}" if tier.amount is not None else _UNKNOWN
+        value = f"{_truncate(tier.name, _MAX_PRICE_NAME_LENGTH)}: "
+        if tier.currency:
+            value += f"{_truncate(tier.currency, _MAX_CURRENCY_LENGTH)} "
+        value += amount
         if tier.period:
-            value += f"/{_truncate(tier.period, _MAX_PRICE_PART_LENGTH)}"
+            value += f"/{_truncate(tier.period, _MAX_PERIOD_LENGTH)}"
         if tier.unit:
-            value += f"/{_truncate(tier.unit, _MAX_PRICE_PART_LENGTH)}"
+            value += f"/{_truncate(tier.unit, _MAX_UNIT_LENGTH)}"
         values.append(value)
     return "; ".join(values)
 
@@ -70,20 +87,36 @@ def _product_block(product: DigestProduct) -> str:
     )
     evidence = (
         " ".join(
-            f"[\u6765\u6e90{index}]({_truncate(url, _MAX_EVIDENCE_URL_LENGTH)})"
+            _display_url(url, f"\u6765\u6e90{index}", _EVIDENCE_URL_TOO_LONG)
             for index, url in enumerate(product.evidence_urls, start=1)
         )
         or _UNKNOWN
     )
+    name = _truncate(product.name, _MAX_NAME_LENGTH)
+    heading = _display_url(product.homepage, name, _HOME_URL_TOO_LONG)
+    if heading == _HOME_URL_TOO_LONG:
+        heading = f"### {name}\n{heading}"
+    else:
+        heading = f"### {heading}"
+    confidence = f"{product.confidence:.0%}" if product.confidence > 0 else _UNKNOWN
     return "\n".join(
         [
-            f"### [{_truncate(product.name, _MAX_NAME_LENGTH)}]({_truncate(product.homepage, _MAX_HOME_URL_LENGTH)})",
+            heading,
             f"**\u6838\u5fc3\u529f\u80fd**\uFF1A{features}",
             f"**\u5957\u9910\u4ef7\u683c**\uFF1A{_price_text(product)}",
             f"**\u5173\u952e\u914d\u7f6e**\uFF1A{configurations}",
-            f"**\u7f6e\u4fe1\u5ea6**\uFF1A{product.confidence:.0%}",
+            f"**\u7f6e\u4fe1\u5ea6**\uFF1A{confidence}",
             f"**\u5b98\u65b9\u8bc1\u636e**\uFF1A{evidence}",
         ]
+    )
+
+
+def _change_line(change: ChangeEvent) -> str:
+    return (
+        f"**{_truncate(change.candidate_id, _MAX_CHANGE_ID_LENGTH)}** \u00b7 "
+        f"`{_truncate(change.field_path, _MAX_CHANGE_FIELD_LENGTH)}`\n"
+        f"{_truncate(change.before, _MAX_CHANGE_VALUE_LENGTH)} \u2192 "
+        f"{_truncate(change.after, _MAX_CHANGE_VALUE_LENGTH)} ({change.importance.value})"
     )
 
 
@@ -96,29 +129,30 @@ def render_payload(digest: Digest) -> dict:
     """
 
     elements: list[dict] = [
-        {"tag": "markdown", "content": digest.summary},
+        {"tag": "markdown", "content": _truncate(digest.summary, _MAX_SUMMARY_LENGTH)},
     ]
     elements.extend(
         {"tag": "markdown", "content": _product_block(product)}
-        for product in digest.products
+        for product in digest.products[:5]
     )
-    if digest.changes:
+    confirmed_changes = [change for change in digest.changes if change.confirmed]
+    if confirmed_changes:
         elements.append({"tag": "markdown", "content": "**\u91cd\u70b9\u53d8\u5316**"})
         elements.extend(
             {"tag": "markdown", "content": _change_line(change)}
-            for change in digest.changes[:5]
+            for change in confirmed_changes[:5]
         )
     elements.append(
         {
             "tag": "markdown",
-            "content": f"\u672c\u5730\u5b8c\u6574\u62a5\u544a\uFF1A{digest.report_path}",
+            "content": f"\u672c\u5730\u5b8c\u6574\u62a5\u544a\uFF1A{_truncate(digest.report_path, _MAX_REPORT_PATH_LENGTH)}",
         }
     )
     return {
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": digest.title},
+                "title": {"tag": "plain_text", "content": _truncate(digest.title, _MAX_TITLE_LENGTH)},
                 "template": "blue",
             },
             "elements": elements,

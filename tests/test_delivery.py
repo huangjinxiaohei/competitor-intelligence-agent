@@ -119,6 +119,116 @@ def test_render_payload_with_maximum_products_is_under_twenty_kilobytes() -> Non
     assert len(serialized) < 20_000
 
 
+def test_render_payload_filters_unconfirmed_changes_before_limiting() -> None:
+    changes = [
+        ChangeEvent(
+            candidate_id="unconfirmed-only",
+            field_path="pricing.hidden",
+            before="old",
+            after="new",
+            importance=ChangeImportance.HIGH,
+            confirmed=False,
+        ),
+        *[
+            ChangeEvent(
+                candidate_id=f"confirmed-{index}",
+                field_path="pricing.visible",
+                before="old",
+                after="new",
+                importance=ChangeImportance.HIGH,
+                confirmed=True,
+            )
+            for index in range(5)
+        ],
+    ]
+
+    payload = render_payload(make_digest(0).model_copy(update={"changes": changes}))
+    text = str(payload)
+
+    assert "unconfirmed-only" not in text
+    for index in range(5):
+        assert f"confirmed-{index}" in text
+
+
+def test_render_payload_labels_missing_price_amount_and_zero_confidence() -> None:
+    product = DigestProduct(
+        candidate_id="unknown-price",
+        name="Unknown price",
+        homepage="https://unknown-price.test",
+        pricing=[PriceTier(name="Enterprise", amount=None)],
+        confidence=0.0,
+    )
+
+    text = str(render_payload(make_digest(0).model_copy(update={"products": [product]})))
+
+    assert "Enterprise: \u6682\u672a\u8bc6\u522b" in text
+    assert "**\u7f6e\u4fe1\u5ea6**\uFF1A\u6682\u672a\u8bc6\u522b" in text
+    assert "\u8054\u7cfb\u9500\u552e" not in text
+
+
+def test_render_payload_stays_under_twenty_kilobytes_for_unbounded_digest_inputs() -> None:
+    huge = "\u6570\u636e" * 50_000
+    products = [
+        DigestProduct(
+            candidate_id=f"product-{index}",
+            name=huge,
+            homepage=f"https://product-{index}.test/" + ("h" * 50_000),
+            summary=huge,
+            features=[huge] * 5,
+            pricing=[
+                PriceTier(name=huge, amount=tier, currency=huge, period=huge, unit=huge)
+                for tier in range(3)
+            ],
+            configurations={huge + str(setting): huge for setting in range(3)},
+            confidence=0.9,
+            evidence_urls=[f"https://evidence.test/{huge}" for _ in range(2)],
+        )
+        for index in range(5)
+    ]
+    changes = [
+        ChangeEvent(
+            candidate_id=huge,
+            field_path=huge,
+            before=huge,
+            after=huge,
+            importance=ChangeImportance.HIGH,
+        )
+        for _ in range(6)
+    ]
+    digest = make_digest(0).model_copy(
+        update={
+            "title": huge,
+            "summary": huge,
+            "report_path": huge,
+            "products": products,
+            "changes": changes,
+        }
+    )
+
+    serialized = json.dumps(render_payload(digest), ensure_ascii=False).encode("utf-8")
+
+    assert len(serialized) < 20_000
+
+
+def test_render_payload_never_truncates_a_long_url_into_a_link() -> None:
+    long_url = "https://evidence.test/" + ("x" * 50_000)
+    product = DigestProduct(
+        candidate_id="long-url",
+        name="Long URL",
+        homepage="https://long-url.test/" + ("h" * 50_000),
+        evidence_urls=[long_url],
+    )
+
+    payload = render_payload(make_digest(0).model_copy(update={"products": [product]}))
+    serialized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    text = str(payload)
+
+    assert len(serialized) < 20_000
+    assert long_url not in text
+    assert "\u8bc1\u636e\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a" in text
+    assert "\u4e3b\u9875\u94fe\u63a5\u8fc7\u957f\uff0c\u89c1\u5b8c\u6574\u62a5\u544a" in text
+
+
 def test_mock_adapter_records_the_digest() -> None:
     adapter = MockDeliveryAdapter()
     digest = make_digest(1)

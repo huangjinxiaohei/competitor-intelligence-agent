@@ -1,0 +1,470 @@
+"""Official Feishu Bitable client and idempotent Base bootstrap.
+
+The module deliberately keeps Base provisioning separate from projection writes.
+SQLite stores the identifiers it creates, so a later projection can rebuild data
+without treating Feishu as the source of truth.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import re
+import time
+from typing import Any, Callable
+
+import httpx
+
+from .config import ProjectConfig
+from .models import ProjectionReceipt
+from .storage import StateStore
+
+
+_AUTH_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
+_API_ORIGIN = "https://open.feishu.cn"
+_TOKEN_REFRESH_SECONDS = 60
+_MAX_RETRIES = 3
+_URL_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"\b(?:t|u|a)-[A-Za-z0-9_-]{6,}\b")
+
+
+class FeishuBaseError(RuntimeError):
+    """A sanitized, actionable Feishu Base operation failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class BaseDoctorResult:
+    ok: bool
+    checks: dict[str, str]
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    name: str
+    type: int
+    relation_to: str | None = None
+    human_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TableSpec:
+    key: str
+    name: str
+    fields: tuple[FieldSpec, ...]
+
+
+_TEXT = 1
+_NUMBER = 2
+_SINGLE_SELECT = 3
+_MULTI_SELECT = 4
+_DATETIME = 5
+_CHECKBOX = 7
+_URL = 15
+_DUPLEX_LINK = 21
+
+TABLES: tuple[TableSpec, ...] = (
+    TableSpec(
+        "competitors",
+        "竞品主表",
+        (
+            FieldSpec("竞品 ID", _TEXT), FieldSpec("名称", _TEXT), FieldSpec("官网", _URL),
+            FieldSpec("状态", _SINGLE_SELECT), FieldSpec("评分", _NUMBER), FieldSpec("摘要", _TEXT),
+            FieldSpec("功能", _TEXT), FieldSpec("配置", _TEXT), FieldSpec("可用性", _TEXT),
+            FieldSpec("置信度", _NUMBER), FieldSpec("证据", _TEXT), FieldSpec("最后采集时间", _DATETIME),
+            FieldSpec("人工关注级别", _SINGLE_SELECT, human_owned=True),
+            FieldSpec("标签", _MULTI_SELECT, human_owned=True), FieldSpec("备注", _TEXT, human_owned=True),
+        ),
+    ),
+    TableSpec(
+        "pricing",
+        "套餐价格表",
+        (
+            FieldSpec("价格键", _TEXT), FieldSpec("关联竞品", _DUPLEX_LINK, relation_to="competitors"),
+            FieldSpec("套餐", _TEXT), FieldSpec("金额", _NUMBER), FieldSpec("币种", _TEXT),
+            FieldSpec("周期", _TEXT), FieldSpec("单位", _TEXT), FieldSpec("限定条件", _TEXT),
+            FieldSpec("有效状态", _CHECKBOX), FieldSpec("观测时间", _DATETIME), FieldSpec("证据", _TEXT),
+        ),
+    ),
+    TableSpec(
+        "changes",
+        "变化事件表",
+        (
+            FieldSpec("事件 ID", _TEXT), FieldSpec("关联竞品", _DUPLEX_LINK, relation_to="competitors"),
+            FieldSpec("字段路径", _TEXT), FieldSpec("前值", _TEXT), FieldSpec("后值", _TEXT),
+            FieldSpec("重要度", _SINGLE_SELECT), FieldSpec("检测时间", _DATETIME),
+            FieldSpec("证据", _TEXT), FieldSpec("运行 ID", _TEXT),
+        ),
+    ),
+    TableSpec(
+        "runs",
+        "运行日志表",
+        (
+            FieldSpec("运行 ID", _TEXT), FieldSpec("状态", _SINGLE_SELECT), FieldSpec("耗时秒", _NUMBER),
+            FieldSpec("候选数", _NUMBER), FieldSpec("快照数", _NUMBER), FieldSpec("变化数", _NUMBER),
+            FieldSpec("失败数", _NUMBER), FieldSpec("模型降级", _CHECKBOX), FieldSpec("Base 同步", _TEXT),
+            FieldSpec("消息状态", _TEXT), FieldSpec("本地报告路径", _TEXT), FieldSpec("是否最新", _CHECKBOX),
+        ),
+    ),
+)
+
+VIEWS: tuple[tuple[str, str, str], ...] = (
+    ("competitors", "竞品总览", "grid"), ("competitors", "竞品卡片", "gallery"),
+    ("competitors", "低置信度", "grid"), ("pricing", "价格对比", "grid"),
+    ("changes", "本周变化", "grid"), ("changes", "高优先级变化", "kanban"),
+    ("runs", "指标总览", "grid"), ("runs", "采集异常", "grid"), ("runs", "运行历史", "grid"),
+)
+
+
+def _redact(value: object) -> str:
+    """Remove bearer credentials and URLs from exception diagnostics."""
+    text = str(value)
+    text = _URL_RE.sub("[url]", text)
+    return _TOKEN_RE.sub("[token]", text)
+
+
+class FeishuBaseClient:
+    """Small synchronous client covering setup and future projection writes."""
+
+    def __init__(
+        self,
+        app_id: str | None = None,
+        app_secret: str | None = None,
+        *,
+        client: httpx.Client | None = None,
+        now: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        max_retries: int = _MAX_RETRIES,
+    ) -> None:
+        self.app_id = app_id if app_id is not None else os.getenv("FEISHU_APP_ID", "")
+        self.app_secret = app_secret if app_secret is not None else os.getenv("FEISHU_APP_SECRET", "")
+        self._client = client or httpx.Client(base_url=_API_ORIGIN, timeout=15.0)
+        self._now = now
+        self._sleep = sleep
+        self._max_retries = max(0, max_retries)
+        self._token: str | None = None
+        self._token_expires_at = 0.0
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.app_id and self.app_secret)
+
+    def tenant_token(self) -> str:
+        if not self.has_credentials:
+            raise FeishuBaseError("Feishu credentials are not configured.")
+        if self._token is not None and self._now() < self._token_expires_at - _TOKEN_REFRESH_SECONDS:
+            return self._token
+        try:
+            response = self._client.post(
+                _AUTH_PATH,
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+        except httpx.HTTPError as exc:
+            raise FeishuBaseError("Feishu authentication request failed.") from exc
+        payload = self._response_payload(response, "authentication")
+        token = payload.get("tenant_access_token")
+        if not isinstance(token, str) or not token:
+            raise FeishuBaseError("Feishu authentication response did not contain a tenant token.")
+        expire = payload.get("expire", 7200)
+        self._token = token
+        self._token_expires_at = self._now() + max(1, int(expire))
+        return token
+
+    def _response_payload(self, response: httpx.Response, action: str) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if not 200 <= response.status_code < 300 or code not in (0, None):
+            suffix = f", code {code}" if code is not None else ""
+            raise FeishuBaseError(f"Feishu {action} failed (HTTP {response.status_code}{suffix}).")
+        if not isinstance(payload, dict):
+            raise FeishuBaseError(f"Feishu {action} returned an invalid response.")
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            raise FeishuBaseError(f"Feishu {action} returned an invalid data object.")
+        return data
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call an authenticated OpenAPI endpoint with bounded transient retries."""
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._client.request(
+                    method,
+                    path,
+                    json=json_body,
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {self.tenant_token()}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                )
+            except httpx.HTTPError as exc:
+                if attempt < self._max_retries:
+                    self._sleep(min(2.0**attempt, 4.0))
+                    continue
+                raise FeishuBaseError("Feishu request failed while contacting the API.") from exc
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < self._max_retries:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        delay = float(retry_after) if retry_after is not None else min(2.0**attempt, 4.0)
+                    except ValueError:
+                        delay = min(2.0**attempt, 4.0)
+                    self._sleep(max(0.0, delay))
+                    continue
+            return self._response_payload(response, "API request")
+        raise FeishuBaseError("Feishu request retry budget exhausted.")
+
+    def list_paginated(self, path: str, *, item_key: str = "items", params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        query = dict(params or {})
+        query.setdefault("page_size", 100)
+        while True:
+            data = self.request("GET", path, params=query)
+            page_items = data.get(item_key, [])
+            if not isinstance(page_items, list):
+                raise FeishuBaseError("Feishu list response did not contain an item list.")
+            items.extend(item for item in page_items if isinstance(item, dict))
+            if not data.get("has_more"):
+                return items
+            token = data.get("page_token")
+            if not isinstance(token, str) or not token:
+                raise FeishuBaseError("Feishu paginated response omitted page_token.")
+            query["page_token"] = token
+
+    def create_base(self, name: str) -> dict[str, Any]:
+        return self.request("POST", "/open-apis/bitable/v1/apps", json_body={"name": name})
+
+    def list_tables(self, app_token: str) -> list[dict[str, Any]]:
+        return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables")
+
+    def create_table(self, app_token: str, name: str) -> dict[str, Any]:
+        return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables", json_body={"table": {"name": name}})
+
+    def list_fields(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
+        return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
+
+    def create_field(self, app_token: str, table_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields", json_body=payload).get("field", {})
+
+    def list_views(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
+        return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views")
+
+    def create_view(self, app_token: str, table_id: str, name: str, view_type: str) -> dict[str, Any]:
+        data = self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views", json_body={"view_name": name, "view_type": view_type})
+        return data.get("view", {})
+
+    def list_records(self, app_token: str, table_id: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records", params=params)
+
+    def create_record(self, app_token: str, table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records", json_body={"fields": fields}).get("record", {})
+
+    def update_record(self, app_token: str, table_id: str, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        return self.request("PUT", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}", json_body={"fields": fields}).get("record", {})
+
+    def create_records(self, app_token: str, table_id: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(records) > 200:
+            raise ValueError("Feishu batch create accepts at most 200 records")
+        return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create", json_body={"records": records}).get("records", [])
+
+    def update_records(self, app_token: str, table_id: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(records) > 200:
+            raise ValueError("Feishu batch update accepts at most 200 records")
+        return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update", json_body={"records": records}).get("records", [])
+
+    def grant_permission(self, app_token: str, *, member_type: str, member_id: str, perm: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"/open-apis/drive/v1/permissions/{app_token}/members",
+            params={"type": "bitable"},
+            json_body={"member_type": member_type, "member_id": member_id, "perm": perm},
+        )
+
+
+class FeishuBaseSetup:
+    """Set up and validate the static Base projection schema without data sync."""
+
+    def __init__(
+        self,
+        client: FeishuBaseClient,
+        config: ProjectConfig | None = None,
+        store: StateStore | None = None,
+        *,
+        owner_email: str | None = None,
+        viewer_chat_id: str | None = None,
+    ) -> None:
+        self.client = client
+        self.config = config
+        self.store = store
+        self.owner_email = owner_email if owner_email is not None else os.getenv("FEISHU_OWNER_EMAIL", "")
+        self.viewer_chat_id = viewer_chat_id if viewer_chat_id is not None else os.getenv("FEISHU_VIEWER_CHAT_ID", "")
+
+    @classmethod
+    def from_environment(cls) -> FeishuBaseSetup:
+        return cls(FeishuBaseClient())
+
+    def doctor(self) -> BaseDoctorResult:
+        missing = [name for name, value in (("FEISHU_APP_ID", self.client.app_id), ("FEISHU_APP_SECRET", self.client.app_secret)) if not value]
+        checks: dict[str, str] = {
+            "credentials": "ok" if not missing else f"missing {', '.join(missing)}",
+            "owner_permission": "configured" if self.owner_email else "not configured (optional)",
+            "viewer_permission": "configured" if self.viewer_chat_id else "not configured (optional)",
+            "bot_group_membership": "verify the app bot is already in the viewer chat before granting access",
+        }
+        if missing:
+            return BaseDoctorResult(ok=False, checks=checks, detail="Configure credentials before Base setup.")
+        try:
+            self.client.tenant_token()
+        except FeishuBaseError:
+            checks["authentication"] = "failed; check application credentials and Base scopes"
+            return BaseDoctorResult(ok=False, checks=checks, detail="Authentication capability check failed.")
+        checks["authentication"] = "ok"
+        if self.store is not None:
+            app_token = self.store.get_projection_resource("base")
+            if app_token:
+                try:
+                    self.client.list_tables(app_token)
+                except FeishuBaseError:
+                    checks["bitable_read"] = "failed; check bitable read scope and document access"
+                    return BaseDoctorResult(ok=False, checks=checks, detail="Bitable read capability check failed.")
+                checks["bitable_read"] = "ok"
+        return BaseDoctorResult(ok=True, checks=checks, detail="Token capability check succeeded.")
+
+    def setup(self) -> ProjectionReceipt:
+        if self.config is None or self.store is None or self.config.feishu_base is None:
+            raise FeishuBaseError("Feishu Base setup requires project configuration and a StateStore.")
+        settings = self.config.feishu_base
+        if not settings.enabled:
+            raise FeishuBaseError("Feishu Base projection is disabled in configuration.")
+        app_token, base_url = self._ensure_base(settings.base_name)
+        table_ids = self._ensure_tables(app_token)
+        self._ensure_fields(app_token, table_ids)
+        view_links = self._ensure_views(app_token, table_ids, base_url)
+        self._ensure_permissions(app_token)
+        self._write_manifest(app_token, base_url, table_ids, view_links)
+        return ProjectionReceipt(adapter="feishu-base", synced=True, base_url=base_url, resource_links=view_links, detail="Base schema is ready.")
+
+    def _ensure_base(self, name: str) -> tuple[str, str]:
+        assert self.store is not None
+        app_token = self.store.get_projection_resource("base")
+        base_url = self.store.get_projection_resource_link("base")
+        if not app_token:
+            app_token, base_url = self._load_manifest_base()
+        if not app_token:
+            data = self.client.create_base(name)
+            app = data.get("app", data)
+            app_token = app.get("app_token") if isinstance(app, dict) else None
+            if not isinstance(app_token, str) or not app_token:
+                raise FeishuBaseError("Feishu Base creation response did not contain app_token.")
+            base_url = app.get("url") if isinstance(app, dict) else None
+        base_url = base_url if isinstance(base_url, str) and base_url else f"https://feishu.cn/base/{app_token}"
+        self.store.set_projection_resource("base", app_token, base_url)
+        return app_token, base_url
+
+    def _load_manifest_base(self) -> tuple[str | None, str | None]:
+        assert self.config is not None and self.config.feishu_base is not None
+        path = Path(self.config.feishu_base.manifest_path)
+        if not path.exists():
+            return None, None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None, None
+        base = data.get("base", {}) if isinstance(data, dict) else {}
+        return (base.get("id"), base.get("url")) if isinstance(base, dict) else (None, None)
+
+    def _ensure_tables(self, app_token: str) -> dict[str, str]:
+        assert self.store is not None
+        existing = self.client.list_tables(app_token)
+        by_name = {str(item.get("name")): str(item.get("table_id")) for item in existing if item.get("name") and item.get("table_id")}
+        known_ids = {str(item.get("table_id")) for item in existing if item.get("table_id")}
+        table_ids: dict[str, str] = {}
+        for spec in TABLES:
+            stored = self.store.get_projection_resource(f"table:{spec.key}")
+            table_id = stored if stored in known_ids else by_name.get(spec.name)
+            if not table_id:
+                created = self.client.create_table(app_token, spec.name)
+                table_id = created.get("table_id")
+            if not isinstance(table_id, str) or not table_id:
+                raise FeishuBaseError(f"Feishu did not return an ID for table {spec.key}.")
+            table_ids[spec.key] = table_id
+            self.store.set_projection_resource(f"table:{spec.key}", table_id, f"https://feishu.cn/base/{app_token}?table={table_id}")
+        return table_ids
+
+    def _ensure_fields(self, app_token: str, table_ids: dict[str, str]) -> None:
+        for spec in TABLES:
+            table_id = table_ids[spec.key]
+            existing = {str(item.get("field_name")): item for item in self.client.list_fields(app_token, table_id) if item.get("field_name")}
+            for field in spec.fields:
+                current = existing.get(field.name)
+                if current is not None:
+                    if current.get("type") != field.type:
+                        raise FeishuBaseError(f"Feishu field type mismatch for {spec.key}.{field.name}.")
+                    if field.relation_to:
+                        property_data = current.get("property", {})
+                        expected = table_ids[field.relation_to]
+                        if not isinstance(property_data, dict) or property_data.get("table_id") != expected:
+                            raise FeishuBaseError(f"Feishu relation mismatch for {spec.key}.{field.name}.")
+                    continue
+                payload: dict[str, Any] = {"field_name": field.name, "type": field.type}
+                if field.relation_to:
+                    payload["property"] = {
+                        "table_id": table_ids[field.relation_to],
+                        "multiple": True,
+                        "back_field_name": f"{spec.name}关联",
+                    }
+                self.client.create_field(app_token, table_id, payload)
+
+    def _ensure_views(self, app_token: str, table_ids: dict[str, str], base_url: str) -> dict[str, str]:
+        assert self.store is not None
+        links: dict[str, str] = {}
+        for table_key, name, view_type in VIEWS:
+            table_id = table_ids[table_key]
+            existing = {str(item.get("view_name")): item for item in self.client.list_views(app_token, table_id) if item.get("view_name")}
+            current = existing.get(name)
+            if current is not None:
+                if current.get("view_type") != view_type:
+                    raise FeishuBaseError(f"Feishu view type mismatch for {name}.")
+                view_id = current.get("view_id")
+            else:
+                view_id = self.client.create_view(app_token, table_id, name, view_type).get("view_id")
+            if not isinstance(view_id, str) or not view_id:
+                raise FeishuBaseError(f"Feishu did not return an ID for view {name}.")
+            link = f"{base_url}?table={table_id}&view={view_id}"
+            self.store.set_projection_resource(f"view:{table_key}:{name}", view_id, link)
+            links[name] = link
+        return links
+
+    def _ensure_permissions(self, app_token: str) -> None:
+        if self.owner_email:
+            self.client.grant_permission(app_token, member_type="email", member_id=self.owner_email, perm="edit")
+        if self.viewer_chat_id:
+            self.client.grant_permission(app_token, member_type="chat_id", member_id=self.viewer_chat_id, perm="view")
+
+    def _write_manifest(self, app_token: str, base_url: str, table_ids: dict[str, str], view_links: dict[str, str]) -> None:
+        assert self.config is not None and self.config.feishu_base is not None
+        path = Path(self.config.feishu_base.manifest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        view_ids = {name: self.store.get_projection_resource(f"view:{table_key}:{name}") for table_key, name, _ in VIEWS} if self.store else {}
+        payload = {
+            "schema_version": 1,
+            "base": {"id": app_token, "url": base_url},
+            "tables": table_ids,
+            "views": {name: {"id": view_ids.get(name), "url": url} for name, url in view_links.items()},
+        }
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)

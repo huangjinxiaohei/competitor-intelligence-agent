@@ -187,6 +187,47 @@ class StateStore:
         ).fetchone()
         return ProductSnapshot.model_validate_json(row["payload"]) if row else None
 
+    def list_candidates(self) -> list[Candidate]:
+        """Return all persisted competitors, resolving no external state."""
+        rows = self._db.execute("SELECT payload FROM candidates ORDER BY candidate_id").fetchall()
+        return [Candidate.model_validate_json(row["payload"]) for row in rows]
+
+    def list_latest_snapshots(self) -> list[ProductSnapshot]:
+        """Return one current durable snapshot per persisted competitor."""
+        snapshots: list[ProductSnapshot] = []
+        for candidate in self.list_candidates():
+            snapshot = self.get_latest_snapshot(candidate.id)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
+
+    def list_confirmed_changes(self) -> list[tuple[str, ChangeEvent]]:
+        """Return durable, confirmed change events with their originating run IDs."""
+        rows = self._db.execute("SELECT run_id, payload FROM changes ORDER BY id").fetchall()
+        result: list[tuple[str, ChangeEvent]] = []
+        for row in rows:
+            try:
+                event = ChangeEvent.model_validate_json(row["payload"])
+            except Exception:
+                # Old rows may have only a compatibility shell; they are not facts.
+                continue
+            if event.confirmed:
+                result.append((str(row["run_id"]), event))
+        return result
+
+    def list_finished_run_results(self) -> list[RunResult]:
+        """Return completed result payloads, omitting historical incomplete rows."""
+        rows = self._db.execute(
+            "SELECT payload FROM runs WHERE status != 'running' AND payload IS NOT NULL ORDER BY started_at"
+        ).fetchall()
+        result: list[RunResult] = []
+        for row in rows:
+            try:
+                result.append(RunResult.model_validate_json(row["payload"]))
+            except Exception:
+                continue
+        return result
+
     def save_snapshot(self, snapshot: ProductSnapshot) -> None:
         self._db.execute(
             "INSERT INTO snapshots(candidate_id, observed_at, payload) VALUES (?, ?, ?)",
@@ -352,6 +393,13 @@ class StateStore:
             (resource_key, business_key),
         ).fetchone()
         return str(row["record_id"]) if row else None
+
+    def list_projection_record_mappings(self, resource_key: str) -> dict[str, str]:
+        rows = self._db.execute(
+            "SELECT business_key, record_id FROM projection_record_mappings WHERE resource_key = ?",
+            (resource_key,),
+        ).fetchall()
+        return {str(row["business_key"]): str(row["record_id"]) for row in rows}
 
     def enqueue_projection_outbox(self, operation: str, payload: dict[str, Any]) -> int:
         cursor = self._db.execute(

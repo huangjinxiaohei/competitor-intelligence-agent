@@ -19,18 +19,25 @@ class FakeBase:
         self.create_batches: list[tuple[str, int]] = []
         self.update_batches: list[tuple[str, int, list[dict]]] = []
         self.fail_once = False
+        self.fail_always = False
+        self.short_create_once = False
+        self.short_update_table: str | None = None
 
     def list_records(self, _app: str, table: str) -> list[dict]:
         return list(self.records[table].values())
 
     def create_records(self, _app: str, table: str, records: list[dict]) -> list[dict]:
-        if self.fail_once:
+        if self.fail_once or self.fail_always:
             self.fail_once = False
             from competitor_agent.feishu_base import FeishuBaseError
             raise FeishuBaseError("temporary", operation="projection create")
         self.create_batches.append((table, len(records)))
+        process = records
+        if self.short_create_once:
+            self.short_create_once = False
+            process = records[:1]
         result = []
-        for record in records:
+        for record in process:
             record_id = f"rec-{table}-{len(self.records[table]) + 1}"
             stored = {"record_id": record_id, "fields": dict(record["fields"])}
             self.records[table][record_id] = stored
@@ -39,9 +46,13 @@ class FakeBase:
 
     def update_records(self, _app: str, table: str, records: list[dict]) -> list[dict]:
         self.update_batches.append((table, len(records), records))
-        for record in records:
+        process = records
+        if self.short_update_table == table:
+            self.short_update_table = None
+            process = records[:-1]
+        for record in process:
             self.records[table][record["record_id"]]["fields"].update(record["fields"])
-        return records
+        return process
 
 
 def candidate(index: int = 1) -> Candidate:
@@ -162,3 +173,65 @@ def test_missing_numeric_price_is_explicitly_labeled_without_guessing(tmp_path) 
         assert sales_fields[amount] is None
         assert sales_fields[qualifiers] == "\u8054\u7cfb\u9500\u552e"
         assert unknown_fields[qualifiers] == "\u6682\u672a\u8bc6\u522b"
+
+
+def test_failed_old_outbox_stops_current_writes_then_replays_without_duplicates(tmp_path) -> None:
+    api = FakeBase()
+    with StateStore(tmp_path / "state.sqlite") as store:
+        provision(store); store.save_candidates([candidate()]); store.save_snapshot(snapshot())
+        projection = FeishuBaseProjection(api, store)
+        api.fail_once = True
+        first = projection.resync()
+        assert not first.synced and first.outbox_pending == 1
+        api.fail_always = True
+        batches_before = list(api.create_batches)
+        deferred = projection.resync()
+        assert not deferred.synced and api.create_batches == batches_before
+        assert not api.records["tc"]
+        api.fail_always = False
+        final = projection.resync()
+        assert final.synced and len(api.records["tc"]) == 1
+        assert final.outbox_pending == 0
+
+
+def test_short_create_reconciles_remote_subset_and_retries_only_unresolved(tmp_path) -> None:
+    api = FakeBase()
+    with StateStore(tmp_path / "state.sqlite") as store:
+        provision(store); store.save_candidates([candidate(1), candidate(2)])
+        store.save_snapshot(snapshot(1)); store.save_snapshot(snapshot(2))
+        api.short_create_once = True
+        projection = FeishuBaseProjection(api, store)
+        first = projection.resync()
+        assert not first.synced and len(api.records["tc"]) == 1
+        second = projection.resync()
+        assert second.synced and len(api.records["tc"]) == 2
+        competitor_id = next(table for table in TABLES if table.key == "competitors").fields[1].name
+        ids = [row["fields"][competitor_id] for row in api.records["tc"].values()]
+        assert sorted(ids) == ["candidate-1", "candidate-2"]
+
+
+def test_short_update_is_deferred_then_replayed_and_current_run_is_not_synced(tmp_path) -> None:
+    api = FakeBase()
+    with StateStore(tmp_path / "state.sqlite") as store:
+        provision(store); store.save_candidates([candidate()]); store.save_snapshot(snapshot())
+        projection = FeishuBaseProjection(api, store)
+        projection.resync()
+        store.save_snapshot(snapshot(amount=12))
+        api.short_update_table = "tp"
+        partial = projection.sync(run=result("run-current"))
+        assert not partial.synced and partial.outbox_pending == 1
+        run_row = next(iter(api.records["tr"].values()))
+        base_sync = next(table for table in TABLES if table.key == "runs").fields[8].name
+        assert run_row["fields"][base_sync] == "deferred"
+        amount = next(table for table in TABLES if table.key == "pricing").fields[3].name
+        assert next(iter(api.records["tp"].values()))["fields"][amount] == 10
+        recovered = projection.resync()
+        assert recovered.synced and recovered.outbox_pending == 0
+        assert next(iter(api.records["tp"].values()))["fields"][amount] == 12
+
+
+def test_finished_runs_use_deterministic_tie_breaker(tmp_path) -> None:
+    with StateStore(tmp_path / "state.sqlite") as store:
+        first, second = result("run-a"), result("run-b")
+        store.finish_run(second); store.finish_run(first)
+        assert [item.run_id for item in store.list_finished_run_results()] == ["run-a", "run-b"]

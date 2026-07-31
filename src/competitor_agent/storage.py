@@ -218,7 +218,7 @@ class StateStore:
     def list_finished_run_results(self) -> list[RunResult]:
         """Return completed result payloads, omitting historical incomplete rows."""
         rows = self._db.execute(
-            "SELECT payload FROM runs WHERE status != 'running' AND payload IS NOT NULL ORDER BY started_at"
+            "SELECT payload FROM runs WHERE status != 'running' AND payload IS NOT NULL ORDER BY started_at, finished_at, run_id"
         ).fetchall()
         result: list[RunResult] = []
         for row in rows:

@@ -67,8 +67,8 @@ def _evidence(snapshot_or_event: ProductSnapshot | ChangeEvent) -> str:
 def price_key(candidate_id: str, tier: Any) -> str:
     """Stable product-price identity; amount is deliberately excluded.
 
-    A named monthly and yearly variant gets a distinct key through ``period``;
-    qualifiers distinguish otherwise identical negotiated or regional variants.
+    A named monthly and yearly variant gets a distinct key through ``period``.
+    Currency, amount, and qualifiers are mutable attributes of that price row.
     """
     parts = (candidate_id, tier.name.strip().casefold(), (tier.period or "").strip().casefold(),
              (tier.unit or "").strip().casefold())
@@ -94,7 +94,8 @@ class FeishuBaseProjection:
         if resources is None:
             return self._receipt(False, 0, "Base schema resources are missing; run base-setup first.")
         app_token, tables = resources
-        synced = self._drain_outbox(app_token, tables)
+        if not self._drain_outbox(app_token, tables):
+            return self._receipt(False, 0, "Base projection deferred while older batches retry.")
         count = 0
         try:
             candidates = self.store.list_candidates()
@@ -103,12 +104,14 @@ class FeishuBaseProjection:
             competitor_ids = self.store.list_projection_record_mappings("record:competitors")
             count += self._sync_prices(app_token, tables["pricing"], snapshots, competitor_ids)
             count += self._sync_changes(app_token, tables["changes"], competitor_ids)
-            count += self._sync_runs(app_token, tables["runs"])
+            current_state = "deferred" if self.store.list_projection_outbox() else "synced"
+            count += self._sync_runs(app_token, tables["runs"], run, current_state)
         except FeishuBaseError as exc:
             synced = False
             return self._receipt(False, count, f"Base projection deferred: {exc.operation}.")
-        return self._receipt(synced and not self.store.list_projection_outbox(), count,
-                             "Base projection synchronized." if synced else "Base projection has deferred batches.")
+        completed = not self.store.list_projection_outbox()
+        return self._receipt(completed, count,
+                             "Base projection synchronized." if completed else "Base projection has deferred batches.")
 
     def resync(self) -> ProjectionReceipt:
         """Rebuild the remote projection only; no collection work is triggered."""
@@ -245,8 +248,13 @@ class FeishuBaseProjection:
             }))
         return self._upsert(app, "changes", table, records)
 
-    def _sync_runs(self, app: str, table: str) -> int:
+    def _sync_runs(self, app: str, table: str, current_run: RunResult | None,
+                   current_state: str) -> int:
         finished = self.store.list_finished_run_results()
+        by_id = {item.run_id: item for item in finished}
+        if current_run is not None:
+            by_id[current_run.run_id] = current_run
+        finished = sorted(by_id.values(), key=lambda item: (item.started_at, item.finished_at, item.run_id))
         latest = finished[-1].run_id if finished else ""
         records: list[tuple[str, dict[str, Any]]] = []
         for result in finished:
@@ -260,12 +268,21 @@ class FeishuBaseProjection:
                 _field("runs", "changes"): result.change_count,
                 _field("runs", "failed"): len(result.errors),
                 _field("runs", "model_degraded"): any("model" in error.casefold() or "degrad" in error.casefold() for error in result.errors),
-                _field("runs", "base_sync"): "synced",
+                _field("runs", "base_sync"): self._run_projection_state(result, current_run, current_state),
                 _field("runs", "message_status"): "sent" if result.delivery and result.delivery.delivered else "not_sent",
                 _field("runs", "report_path"): result.digest.report_path if result.digest else "",
                 _field("runs", "latest"): result.run_id == latest,
             }))
         return self._upsert(app, "runs", table, records)
+
+    @staticmethod
+    def _run_projection_state(result: RunResult, current_run: RunResult | None,
+                              current_state: str) -> str:
+        if current_run is not None and result.run_id == current_run.run_id:
+            return current_state
+        if result.projection is not None:
+            return "synced" if result.projection.synced else "partial"
+        return "not_recorded"
 
     def _upsert(self, app: str, table_key: str, table: str, entries: list[tuple[str, dict[str, Any]]], *, create_missing: bool = True) -> int:
         if not entries:
@@ -334,14 +351,21 @@ class FeishuBaseProjection:
         if not isinstance(records, list) or len(records) > _BATCH_SIZE:
             raise FeishuBaseError("Projection operation has invalid batch size.", operation="projection write")
         if kind == "create":
-            created = self.client.create_records(app, table, [{"fields": item["fields"]} for item in records])
-            if len(created) != len(records):
+            unresolved = self._reconcile_create(app, table_key, table, records)
+            if not unresolved:
+                return
+            created = self.client.create_records(app, table, [{"fields": item["fields"]} for item in unresolved])
+            if not isinstance(created, list):
+                raise FeishuBaseError("Feishu returned an invalid create batch.", operation="projection create")
+            for source, target in zip(unresolved, created, strict=False):
+                record_id = target.get("record_id") if isinstance(target, dict) else None
+                if isinstance(record_id, str) and record_id:
+                    self.store.set_projection_record_mapping(f"record:{table_key}", str(source["business_key"]), record_id)
+            # A short response can still have committed a subset. Reconcile the
+            # service before queuing so the retry only sends business keys absent remotely.
+            remaining = self._reconcile_create(app, table_key, table, unresolved)
+            if remaining:
                 raise FeishuBaseError("Feishu returned an incomplete create batch.", operation="projection create")
-            for source, target in zip(records, created, strict=True):
-                record_id = target.get("record_id")
-                if not isinstance(record_id, str) or not record_id:
-                    raise FeishuBaseError("Feishu create response omitted record ID.", operation="projection create")
-                self.store.set_projection_record_mapping(f"record:{table_key}", str(source["business_key"]), record_id)
         elif kind == "update":
             current = mappings or self.store.list_projection_record_mappings(f"record:{table_key}")
             payload = []
@@ -350,9 +374,22 @@ class FeishuBaseProjection:
                 if not record_id:
                     raise FeishuBaseError("Projection record mapping is missing.", operation="projection update")
                 payload.append({"record_id": record_id, "fields": item["fields"]})
-            self.client.update_records(app, table, payload)
+            updated = self.client.update_records(app, table, payload)
+            expected = {item["record_id"] for item in payload}
+            actual = {item.get("record_id") for item in updated if isinstance(item, dict)} if isinstance(updated, list) else set()
+            if actual != expected:
+                raise FeishuBaseError("Feishu returned an incomplete update batch.", operation="projection update")
         else:
             raise FeishuBaseError("Projection operation is unknown.", operation="projection write")
+
+    def _reconcile_create(self, app: str, table_key: str, table: str,
+                          records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        keys = [str(item["business_key"]) for item in records]
+        mappings = self.store.list_projection_record_mappings(f"record:{table_key}")
+        missing = [key for key in keys if key not in mappings]
+        if missing:
+            mappings.update(self._recover_mappings(app, table_key, table, missing))
+        return [item for item in records if str(item["business_key"]) not in mappings]
 
     def _drain_outbox(self, app: str, tables: dict[str, str]) -> bool:
         all_ok = True

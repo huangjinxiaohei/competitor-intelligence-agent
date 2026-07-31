@@ -438,9 +438,21 @@ class FeishuBaseSetup:
         assert self.store is not None
         sqlite_token = self.store.get_projection_resource("base")
         sqlite_url = self.store.get_projection_resource_link("base")
+        phase_token = (
+            self.store.get_projection_resource_link("setup:phase")
+            if self.store.get_projection_resource("setup:phase") == "base-created"
+            else None
+        )
         manifest_token, manifest_url = self._load_manifest_base()
         candidates: list[tuple[str, str | None]] = []
-        for token, url in ((sqlite_token, sqlite_url), (manifest_token, manifest_url)):
+        # The phase marker is written before the normal Base mapping. Treat it
+        # as a recovery candidate so an interruption between those local commits
+        # never creates a second Base on restart.
+        for token, url in (
+            (sqlite_token, sqlite_url),
+            (phase_token, None),
+            (manifest_token, manifest_url),
+        ):
             if isinstance(token, str) and token and token not in {item[0] for item in candidates}:
                 candidates.append((token, url if isinstance(url, str) else None))
         if candidates:

@@ -477,6 +477,65 @@ def test_create_then_first_list_failure_reuses_marked_base_on_retry(tmp_path: Pa
     store.close()
 
 
+def test_restart_between_phase_and_base_mapping_recovers_created_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tables = [{"table_id": "tbl-default", "name": "Default blank table"}]
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content or b"{}")
+        calls.append((request.method, path))
+        if path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.method == "POST" and path == "/open-apis/bitable/v1/apps":
+            return response({"app": {"app_token": "app-created", "url": "https://feishu.cn/base/app-created"}})
+        if request.method == "GET" and path.endswith("/apps/app-created/tables"):
+            return response({"items": tables, "has_more": False})
+        if request.method == "PATCH" and path.endswith("/tables/tbl-default"):
+            tables[0]["name"] = body["name"]
+            return response({"table": tables[0]})
+        if request.method == "POST" and path.endswith("/tables"):
+            table_id = f"tbl-{len(tables) + 1}"
+            tables.append({"table_id": table_id, "name": body["table"]["name"]})
+            return response({"table_id": table_id})
+        raise AssertionError(f"Unexpected {request.method} {path}")
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    setup = FeishuBaseSetup(client(handler), config(tmp_path), store)
+    original_set_resource = store.set_projection_resource
+
+    def crash_before_base_mapping(resource_key: str, resource_id: str, link: str | None = None) -> None:
+        if resource_key == "base":
+            raise RuntimeError("simulated process interruption")
+        original_set_resource(resource_key, resource_id, link)
+
+    monkeypatch.setattr(store, "set_projection_resource", crash_before_base_mapping)
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        setup._ensure_base("Competitor Base")
+    assert store.get_projection_resource("base") is None
+    assert store.get_projection_resource("setup:phase") == "base-created"
+    assert store.get_projection_resource_link("setup:phase") == "app-created"
+
+    monkeypatch.setattr(store, "set_projection_resource", original_set_resource)
+    recovered = FeishuBaseSetup(client(handler), config(tmp_path), store)
+    app_token, _, existing = recovered._ensure_base("Competitor Base")
+    initial_table_id = recovered._capture_initial_table(app_token, existing)
+    table_ids = recovered._ensure_tables(
+        app_token,
+        initial_table_id=initial_table_id,
+        existing_tables=existing,
+    )
+
+    assert app_token == "app-created"
+    assert len(table_ids) == 4
+    assert len(tables) == 4
+    assert {table["name"] for table in tables} == {spec.name for spec in TABLES}
+    assert sum(method == "POST" and path == "/open-apis/bitable/v1/apps" for method, path in calls) == 1
+    store.close()
+
 def test_manifest_fallback_ignores_phase_metadata_for_another_base(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("tenant_access_token/internal"):

@@ -333,6 +333,8 @@ def run_pipeline(
         store.close()
         raise RuntimeError(f"Project {config.project.id!r} already has an active run")
 
+    projection_client: object | None = None
+    projection_client_owned = False
     try:
         first_run = not [
             item for item in store.list_runs() if item.get("status") != "running"
@@ -417,12 +419,10 @@ def run_pipeline(
         store.finish_run(preliminary)
         projection_receipt = None
         projection: ProjectionAdapter | None = projection_adapter
-        client: object | None = None
-        owned_client = False
         if _projection_enabled(config) and (not fixture or projection_adapter is not None):
             if projection is None:
-                client, owned_client = _owned_base_client(base_client)
-                projection = FeishuBaseProjection(client, store)
+                projection_client, projection_client_owned = _owned_base_client(base_client)
+                projection = FeishuBaseProjection(projection_client, store)
             try:
                 projection_receipt = projection.sync(preliminary)
                 if not projection_receipt.synced:
@@ -432,9 +432,6 @@ def run_pipeline(
                 projection_receipt = ProjectionReceipt(
                     adapter="feishu-base", synced=False, detail="Base sync deferred; retry queued."
                 )
-            finally:
-                if client is not None:
-                    _close_client(client, owned_client)
             digest = _attach_projection(digest, projection_receipt, projection)
 
         receipt: DeliveryReceipt | None = None
@@ -457,8 +454,29 @@ def run_pipeline(
             projection=projection_receipt, errors=errors,
         )
         store.finish_run(result)
+        # One idempotent replay updates the current Base run row with the final
+        # webhook status. Record keys keep this an update rather than an append.
+        if projection is not None and projection_receipt is not None and projection_receipt.synced:
+            try:
+                final_receipt = projection.sync(result)
+                if not final_receipt.synced:
+                    errors.append("Base final run-log refresh deferred; retry queued.")
+                projection_receipt = final_receipt
+            except (FeishuBaseError, RuntimeError, OSError) as exc:
+                errors.append(f"Base final run-log refresh deferred: {type(exc).__name__}.")
+                projection_receipt = ProjectionReceipt(
+                    adapter="feishu-base", synced=False, detail="Base final run-log refresh deferred."
+                )
+            result = result.model_copy(update={
+                "status": RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
+                "projection": projection_receipt,
+                "errors": errors,
+            })
+            store.finish_run(result)
         return result
     finally:
+        if projection_client is not None:
+            _close_client(projection_client, projection_client_owned)
         store.release_run_lock(config.project.id)
         store.close()
 

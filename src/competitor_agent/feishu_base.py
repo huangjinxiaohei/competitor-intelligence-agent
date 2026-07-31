@@ -28,7 +28,20 @@ _MAX_RETRIES = 3
 
 
 class FeishuBaseError(RuntimeError):
-    """A sanitized, actionable Feishu Base operation failure."""
+    """A sanitized API failure with only operation and status classifications."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str = "Feishu API request",
+        http_status: int | None = None,
+        api_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.http_status = http_status
+        self.api_code = api_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +63,7 @@ class FieldSpec:
 class TableSpec:
     key: str
     name: str
+    primary_field: str
     fields: tuple[FieldSpec, ...]
 
 
@@ -66,8 +80,9 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         "competitors",
         "竞品主表",
+        "名称",
         (
-            FieldSpec("竞品 ID", _TEXT), FieldSpec("名称", _TEXT), FieldSpec("官网", _URL),
+            FieldSpec("名称", _TEXT), FieldSpec("竞品 ID", _TEXT), FieldSpec("官网", _URL),
             FieldSpec("状态", _SINGLE_SELECT), FieldSpec("评分", _NUMBER), FieldSpec("摘要", _TEXT),
             FieldSpec("功能", _TEXT), FieldSpec("配置", _TEXT), FieldSpec("可用性", _TEXT),
             FieldSpec("置信度", _NUMBER), FieldSpec("证据", _TEXT), FieldSpec("最后采集时间", _DATETIME),
@@ -78,6 +93,7 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         "pricing",
         "套餐价格表",
+        "价格键",
         (
             FieldSpec("价格键", _TEXT), FieldSpec("关联竞品", _DUPLEX_LINK, relation_to="competitors"),
             FieldSpec("套餐", _TEXT), FieldSpec("金额", _NUMBER), FieldSpec("币种", _TEXT),
@@ -88,6 +104,7 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         "changes",
         "变化事件表",
+        "事件 ID",
         (
             FieldSpec("事件 ID", _TEXT), FieldSpec("关联竞品", _DUPLEX_LINK, relation_to="competitors"),
             FieldSpec("字段路径", _TEXT), FieldSpec("前值", _TEXT), FieldSpec("后值", _TEXT),
@@ -98,6 +115,7 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         "runs",
         "运行日志表",
+        "运行 ID",
         (
             FieldSpec("运行 ID", _TEXT), FieldSpec("状态", _SINGLE_SELECT), FieldSpec("耗时秒", _NUMBER),
             FieldSpec("候选数", _NUMBER), FieldSpec("快照数", _NUMBER), FieldSpec("变化数", _NUMBER),
@@ -183,12 +201,17 @@ class FeishuBaseClient:
         code = payload.get("code") if isinstance(payload, dict) else None
         if not 200 <= response.status_code < 300 or code not in (0, None):
             suffix = f", code {code}" if code is not None else ""
-            raise FeishuBaseError(f"Feishu {action} failed (HTTP {response.status_code}{suffix}).")
+            raise FeishuBaseError(
+                f"Feishu {action} failed (HTTP {response.status_code}{suffix}).",
+                operation=action,
+                http_status=response.status_code,
+                api_code=code if isinstance(code, int) else None,
+            )
         if not isinstance(payload, dict):
-            raise FeishuBaseError(f"Feishu {action} returned an invalid response.")
+            raise FeishuBaseError(f"Feishu {action} returned an invalid response.", operation=action)
         data = payload.get("data", payload)
         if not isinstance(data, dict):
-            raise FeishuBaseError(f"Feishu {action} returned an invalid data object.")
+            raise FeishuBaseError(f"Feishu {action} returned an invalid data object.", operation=action)
         return data
 
     def _send_with_retry(
@@ -209,7 +232,10 @@ class FeishuBaseClient:
                 if attempt < self._max_retries:
                     self._sleep(min(2.0**attempt, 4.0))
                     continue
-                raise FeishuBaseError(f"Feishu {action} failed while contacting the API.") from exc
+                raise FeishuBaseError(
+                    f"Feishu {action} failed while contacting the API.",
+                    operation=action,
+                ) from exc
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < self._max_retries:
                     retry_after = response.headers.get("Retry-After")
@@ -220,7 +246,7 @@ class FeishuBaseClient:
                     self._sleep(max(0.0, delay))
                     continue
             return response
-        raise FeishuBaseError(f"Feishu {action} retry budget exhausted.")
+        raise FeishuBaseError(f"Feishu {action} retry budget exhausted.", operation=action)
 
     def request(
         self,
@@ -283,6 +309,14 @@ class FeishuBaseClient:
 
     def create_field(self, app_token: str, table_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields", json_body=payload).get("field", {})
+
+    def update_field(self, app_token: str, table_id: str, field_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Update the default index field while preserving its type/property contract."""
+        return self.request(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+            json_body=payload,
+        ).get("field", {})
 
     def list_views(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
         return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views")
@@ -387,45 +421,64 @@ class FeishuBaseSetup:
         settings = self.config.feishu_base
         if not settings.enabled:
             raise FeishuBaseError("Feishu Base projection is disabled in configuration.")
-        app_token, base_url, created_base, existing_tables = self._ensure_base(settings.base_name)
-        table_ids = self._ensure_tables(app_token, created_base=created_base, existing_tables=existing_tables)
-        self._ensure_fields(app_token, table_ids)
+        app_token, base_url, existing_tables = self._ensure_base(settings.base_name)
+        initial_table_id = self._initial_table_id()
+        table_ids = self._ensure_tables(app_token, initial_table_id=initial_table_id, existing_tables=existing_tables)
+        self._ensure_fields(app_token, table_ids, allow_primary_rename=self._setup_phase_is_initial())
         view_links = self._ensure_views(app_token, table_ids, base_url)
         self._ensure_permissions(app_token)
         self._write_manifest(app_token, base_url, table_ids, view_links)
+        self.store.set_projection_resource("setup:phase", "complete")
         return ProjectionReceipt(adapter="feishu-base", synced=True, base_url=base_url, resource_links=view_links, detail="Base schema is ready.")
 
-    def _ensure_base(self, name: str) -> tuple[str, str, bool, list[dict[str, Any]]]:
-        """Validate persisted resources before creation; never hide a stale Base by creating another."""
+    def _ensure_base(self, name: str) -> tuple[str, str, list[dict[str, Any]]]:
+        """Validate persisted resources; only explicit Base-not-found may use manifest fallback."""
         assert self.store is not None
         sqlite_token = self.store.get_projection_resource("base")
         sqlite_url = self.store.get_projection_resource_link("base")
         manifest_token, manifest_url = self._load_manifest_base()
         candidates: list[tuple[str, str | None]] = []
-        for candidate in ((sqlite_token, sqlite_url), (manifest_token, manifest_url)):
-            token, url = candidate
+        for token, url in ((sqlite_token, sqlite_url), (manifest_token, manifest_url)):
             if isinstance(token, str) and token and token not in {item[0] for item in candidates}:
                 candidates.append((token, url if isinstance(url, str) else None))
         if candidates:
-            for app_token, base_url in candidates:
+            for index, (app_token, base_url) in enumerate(candidates):
                 try:
                     existing_tables = self.client.list_tables(app_token)
-                except FeishuBaseError:
-                    continue
+                except FeishuBaseError as exc:
+                    # The documented Bitable BaseTokenNotFound code is the only
+                    # deterministic signal that permits switching to a manifest.
+                    if exc.api_code == 1254040 and index < len(candidates) - 1:
+                        continue
+                    raise
                 base_url = base_url or f"https://feishu.cn/base/{app_token}"
                 self.store.set_projection_resource("base", app_token, base_url)
-                return app_token, base_url, False, existing_tables
-            raise FeishuBaseError("Feishu Base recovery failed: persisted and manifest resources are unavailable.")
+                return app_token, base_url, existing_tables
+            raise FeishuBaseError("Feishu Base recovery failed: no usable persisted Base.", operation="base recovery")
         data = self.client.create_base(name)
         app = data.get("app", data)
         app_token = app.get("app_token") if isinstance(app, dict) else None
         if not isinstance(app_token, str) or not app_token:
-            raise FeishuBaseError("Feishu Base creation response did not contain app_token.")
+            raise FeishuBaseError("Feishu Base creation response did not contain app_token.", operation="Base creation")
         base_url = app.get("url") if isinstance(app, dict) else None
         base_url = base_url if isinstance(base_url, str) and base_url else f"https://feishu.cn/base/{app_token}"
-        existing_tables = self.client.list_tables(app_token)
+        # Persist the one-table creation phase before any table/field mutation so
+        # a restarted setup can only resume this known initial resource.
         self.store.set_projection_resource("base", app_token, base_url)
-        return app_token, base_url, True, existing_tables
+        existing_tables = self.client.list_tables(app_token)
+        if len(existing_tables) != 1 or not isinstance(existing_tables[0].get("table_id"), str):
+            raise FeishuBaseError("New Feishu Base did not expose exactly one default table.", operation="Base creation")
+        self.store.set_projection_resource("setup:initial_table", str(existing_tables[0]["table_id"]))
+        self.store.set_projection_resource("setup:phase", "base-created")
+        return app_token, base_url, existing_tables
+
+    def _setup_phase_is_initial(self) -> bool:
+        assert self.store is not None
+        return self.store.get_projection_resource("setup:phase") == "base-created"
+
+    def _initial_table_id(self) -> str | None:
+        assert self.store is not None
+        return self.store.get_projection_resource("setup:initial_table") if self._setup_phase_is_initial() else None
 
     def _load_manifest_base(self) -> tuple[str | None, str | None]:
         assert self.config is not None and self.config.feishu_base is not None
@@ -443,7 +496,7 @@ class FeishuBaseSetup:
         self,
         app_token: str,
         *,
-        created_base: bool,
+        initial_table_id: str | None,
         existing_tables: list[dict[str, Any]],
     ) -> dict[str, str]:
         assert self.store is not None
@@ -452,14 +505,12 @@ class FeishuBaseSetup:
             for item in existing_tables
             if item.get("name") and item.get("table_id")
         }
-        # A just-created Base has exactly one empty default table.  Only in that
-        # creation path may it be renamed; replay never renames an arbitrary table.
         competitors = TABLES[0]
-        if created_base and competitors.name not in by_name and len(existing_tables) == 1:
-            default_id = existing_tables[0].get("table_id")
-            if isinstance(default_id, str) and default_id:
-                self.client.rename_table(app_token, default_id, competitors.name)
-                by_name[competitors.name] = default_id
+        if initial_table_id and competitors.name not in by_name and len(existing_tables) == 1:
+            default = existing_tables[0]
+            if default.get("table_id") == initial_table_id:
+                self.client.rename_table(app_token, initial_table_id, competitors.name)
+                by_name[competitors.name] = initial_table_id
         known_ids = {str(item.get("table_id")) for item in existing_tables if item.get("table_id")}
         table_ids: dict[str, str] = {}
         for spec in TABLES:
@@ -469,7 +520,7 @@ class FeishuBaseSetup:
                 created = self.client.create_table(app_token, spec.name)
                 table_id = created.get("table_id")
             if not isinstance(table_id, str) or not table_id:
-                raise FeishuBaseError(f"Feishu did not return an ID for table {spec.key}.")
+                raise FeishuBaseError(f"Feishu did not return an ID for table {spec.key}.", operation="table setup")
             table_ids[spec.key] = table_id
             self.store.set_projection_resource(
                 f"table:{spec.key}",
@@ -478,27 +529,52 @@ class FeishuBaseSetup:
             )
         return table_ids
 
-    def _ensure_fields(self, app_token: str, table_ids: dict[str, str]) -> None:
+    def _ensure_fields(
+        self,
+        app_token: str,
+        table_ids: dict[str, str],
+        *,
+        allow_primary_rename: bool,
+    ) -> None:
         for spec in TABLES:
             table_id = table_ids[spec.key]
-            existing = {str(item.get("field_name")): item for item in self.client.list_fields(app_token, table_id) if item.get("field_name")}
+            listed = self.client.list_fields(app_token, table_id)
+            existing = {str(item.get("field_name")): item for item in listed if item.get("field_name")}
+            primary = next((item for item in listed if item.get("is_primary") is True), None)
+            if primary is not None and primary.get("field_name") != spec.primary_field and allow_primary_rename:
+                field_id = primary.get("field_id")
+                field_type = primary.get("type")
+                if not isinstance(field_id, str) or field_type != _TEXT:
+                    raise FeishuBaseError(
+                        f"Feishu default primary field is incompatible for {spec.key}.",
+                        operation="field setup",
+                    )
+                self.client.update_field(
+                    app_token,
+                    table_id,
+                    field_id,
+                    {"field_name": spec.primary_field, "type": _TEXT},
+                )
+                existing.pop(str(primary.get("field_name")), None)
+                primary = {**primary, "field_name": spec.primary_field}
+                existing[spec.primary_field] = primary
             for field in spec.fields:
                 current = existing.get(field.name)
                 if current is not None:
                     if current.get("type") != field.type:
-                        raise FeishuBaseError(f"Feishu field type mismatch for {spec.key}.{field.name}.")
+                        raise FeishuBaseError(f"Feishu field type mismatch for {spec.key}.{field.name}.", operation="field setup")
                     if field.relation_to:
                         property_data = current.get("property", {})
                         expected = table_ids[field.relation_to]
                         if not isinstance(property_data, dict) or property_data.get("table_id") != expected:
-                            raise FeishuBaseError(f"Feishu relation mismatch for {spec.key}.{field.name}.")
+                            raise FeishuBaseError(f"Feishu relation mismatch for {spec.key}.{field.name}.", operation="field setup")
                     continue
                 payload: dict[str, Any] = {"field_name": field.name, "type": field.type}
                 if field.relation_to:
                     payload["property"] = {
                         "table_id": table_ids[field.relation_to],
                         "multiple": True,
-                        "back_field_name": f"{spec.name}关联",
+                        "back_field_name": f"{spec.name}\u5173\u8054",
                     }
                 self.client.create_field(app_token, table_id, payload)
 

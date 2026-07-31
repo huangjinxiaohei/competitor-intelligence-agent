@@ -182,7 +182,7 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
             return token_response()
         if request.method == "POST" and path == "/open-apis/bitable/v1/apps":
             tables.append({"table_id": "tbl-default", "name": "Default blank table"})
-            fields["tbl-default"] = []
+            fields["tbl-default"] = [{"field_id": "fld-default", "field_name": "Default field", "type": 1, "is_primary": True}]
             views["tbl-default"] = []
             return response({"app": {"app_token": "app-test", "url": "https://feishu.cn/base/app-test"}})
         if path == "/open-apis/bitable/v1/apps/app-test/tables" and request.method == "GET":
@@ -191,9 +191,15 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
             name = body["table"]["name"]
             table_id = f"tbl{len(tables) + 1}"
             tables.append({"table_id": table_id, "name": name})
-            fields[table_id] = []
+            fields[table_id] = [{"field_id": f"fld-{table_id}", "field_name": "Default field", "type": 1, "is_primary": True}]
             views[table_id] = []
             return response({"table_id": table_id})
+        if "/fields/" in path and request.method == "PUT":
+            table_id, field_id = path.split("/")[-3], path.split("/")[-1]
+            field = next(item for item in fields[table_id] if item["field_id"] == field_id)
+            assert body == {"field_name": next(spec.primary_field for spec in TABLES if spec.primary_field == body["field_name"]), "type": 1}
+            field["field_name"] = body["field_name"]
+            return response({"field": field})
         if path == "/open-apis/bitable/v1/apps/app-test/tables/tbl-default" and request.method == "PATCH":
             assert body == {"name": TABLES[0].name}
             tables[0]["name"] = body["name"]
@@ -233,6 +239,12 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
     all_views = {view["view_name"]: view["view_type"] for rows in views.values() for view in rows}
     assert all_views["竞品卡片"] == "gallery"
     assert all_views["高优先级变化"] == "kanban"
+    primary_names = {table_id: next(field["field_name"] for field in table_fields if field.get("is_primary")) for table_id, table_fields in fields.items()}
+    assert set(primary_names.values()) == {spec.primary_field for spec in TABLES}
+    assert all(field["field_name"] != "Default field" for table_fields in fields.values() for field in table_fields)
+    for spec in TABLES:
+        table_id = next(table["table_id"] for table in tables if table["name"] == spec.name)
+        assert {field["field_name"] for field in fields[table_id]} == {field.name for field in spec.fields}
     permission_payloads = [body for _, path, body in created if "/permissions/app-test/members" in path]
     assert permission_payloads == [
         {"member_type": "email", "member_id": "owner@example.com", "perm": "edit", "type": "user"},
@@ -286,13 +298,108 @@ def test_stale_sqlite_base_recovers_from_valid_manifest(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.initialize()
     store.set_projection_resource("base", "app-stale", "https://feishu.cn/base/app-stale")
-    app_token, base_url, created, tables = FeishuBaseSetup(client(handler), settings, store)._ensure_base("ignored")
-    assert (app_token, base_url, created, tables) == (
-        "app-manifest", "https://feishu.cn/base/app-manifest", False, []
+    app_token, base_url, tables = FeishuBaseSetup(client(handler), settings, store)._ensure_base("ignored")
+    assert (app_token, base_url, tables) == (
+        "app-manifest", "https://feishu.cn/base/app-manifest", []
     )
     assert store.get_projection_resource("base") == "app-manifest"
     store.close()
 
+
+
+def test_permission_or_transient_error_never_switches_to_manifest_base(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.url.path.endswith("/apps/app-current/tables"):
+            return httpx.Response(403, json={"code": 1254302, "msg": "forbidden"})
+        if request.url.path.endswith("/apps/app-old/tables"):
+            return response({"items": [], "has_more": False})
+        raise AssertionError(request.url.path)
+
+    settings = config(tmp_path)
+    Path(settings.feishu_base.manifest_path).write_text(
+        json.dumps({"base": {"id": "app-old", "url": "https://feishu.cn/base/app-old"}}),
+        encoding="utf-8",
+    )
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.set_projection_resource("base", "app-current", "https://feishu.cn/base/app-current")
+    with pytest.raises(FeishuBaseError) as caught:
+        FeishuBaseSetup(client(handler), settings, store)._ensure_base("ignored")
+    assert caught.value.operation == "API request"
+    assert caught.value.http_status == 403
+    assert caught.value.api_code == 1254302
+    assert store.get_projection_resource("base") == "app-current"
+    assert not any("app-old" in call for call in calls)
+    store.close()
+
+
+def test_restart_after_base_creation_resumes_marked_default_table(tmp_path: Path) -> None:
+    tables = [{"table_id": "tbl-default", "name": "Default blank table"}]
+    fields: dict[str, list[dict]] = {
+        "tbl-default": [{"field_id": "fld-default", "field_name": "Default field", "type": 1, "is_primary": True}]
+    }
+    views: dict[str, list[dict]] = {"tbl-default": []}
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content or b"{}")
+        calls.append((request.method, path))
+        if path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.method == "GET" and path.endswith("/tables"):
+            return response({"items": tables, "has_more": False})
+        if request.method == "PATCH" and path.endswith("/tables/tbl-default"):
+            tables[0]["name"] = body["name"]
+            return response({"table": tables[0]})
+        if request.method == "POST" and path.endswith("/tables"):
+            table_id = f"tbl-{len(tables) + 1}"
+            tables.append({"table_id": table_id, "name": body["table"]["name"]})
+            fields[table_id] = [{"field_id": f"fld-{table_id}", "field_name": "Default field", "type": 1, "is_primary": True}]
+            views[table_id] = []
+            return response({"table_id": table_id})
+        if request.method == "GET" and path.endswith("/fields"):
+            return response({"items": fields[path.split("/")[-2]], "has_more": False})
+        if request.method == "PUT" and "/fields/" in path:
+            table_id, field_id = path.split("/")[-3], path.split("/")[-1]
+            field = next(row for row in fields[table_id] if row["field_id"] == field_id)
+            field["field_name"] = body["field_name"]
+            return response({"field": field})
+        if request.method == "POST" and path.endswith("/fields"):
+            table_id = path.split("/")[-2]
+            field = {"field_id": f"fld-{len(fields[table_id]) + 1}", **body}
+            fields[table_id].append(field)
+            return response({"field": field})
+        if request.method == "GET" and path.endswith("/views"):
+            return response({"items": views[path.split("/")[-2]], "has_more": False})
+        if request.method == "POST" and path.endswith("/views"):
+            table_id = path.split("/")[-2]
+            view = {"view_id": f"vew-{len(views[table_id]) + 1}", **body}
+            views[table_id].append(view)
+            return response({"view": view})
+        raise AssertionError(f"{request.method} {path}")
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.set_projection_resource("base", "app-restarted", "https://feishu.cn/base/app-restarted")
+    store.set_projection_resource("setup:initial_table", "tbl-default")
+    store.set_projection_resource("setup:phase", "base-created")
+    receipt = FeishuBaseSetup(client(handler), config(tmp_path), store, owner_email="", viewer_chat_id="").setup()
+    assert receipt.synced
+    assert len(tables) == 4
+    assert set(table["name"] for table in tables) == {spec.name for spec in TABLES}
+    assert not any(method == "POST" and path == "/open-apis/bitable/v1/apps" for method, path in calls)
+    assert store.get_projection_resource("setup:phase") == "complete"
+    assert all(field["field_name"] != "Default field" for table_fields in fields.values() for field in table_fields)
+    for spec in TABLES:
+        table_id = next(table["table_id"] for table in tables if table["name"] == spec.name)
+        assert {field["field_name"] for field in fields[table_id]} == {field.name for field in spec.fields}
+    store.close()
 
 def test_replay_never_renames_an_arbitrary_existing_table(tmp_path: Path) -> None:
     calls: list[str] = []
@@ -309,7 +416,7 @@ def test_replay_never_renames_an_arbitrary_existing_table(tmp_path: Path) -> Non
     store.initialize()
     table_ids = FeishuBaseSetup(client(handler), config(tmp_path), store)._ensure_tables(
         "app-existing",
-        created_base=False,
+        initial_table_id=None,
         existing_tables=[{"table_id": "tbl-arbitrary", "name": "Notes"}],
     )
     assert set(table_ids) == {"competitors", "pricing", "changes", "runs"}
@@ -366,7 +473,7 @@ def test_setup_rejects_existing_field_with_wrong_type(tmp_path: Path) -> None:
         if request.method == "GET" and path.endswith("/tables"):
             return response({"items": [{"table_id": "tbl-comp", "name": "竞品主表"}, {"table_id": "tbl-price", "name": "套餐价格表"}, {"table_id": "tbl-change", "name": "变化事件表"}, {"table_id": "tbl-run", "name": "运行日志表"}], "has_more": False})
         if request.method == "GET" and path.endswith("/fields"):
-            return response({"items": [{"field_name": "竞品 ID", "type": 2}], "has_more": False})
+            return response({"items": [{"field_id": "fld-name", "field_name": "名称", "type": 1, "is_primary": True}, {"field_name": "竞品 ID", "type": 2}], "has_more": False})
         if request.method == "GET" and path.endswith("/views"):
             return response({"items": [], "has_more": False})
         raise AssertionError(path)

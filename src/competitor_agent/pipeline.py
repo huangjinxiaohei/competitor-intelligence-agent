@@ -11,7 +11,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .adapters.search import SearchResult, StaticSearchProvider
-from .analyzer import HeuristicAnalyzer, HttpJsonAnalyzer
+from .analyzer import HeuristicAnalyzer, build_analyzer
 from .collector import collect_candidate
 from .config import ProjectConfig, load_config
 from .delivery import (
@@ -26,11 +26,14 @@ from .models import (
     ChangeEvent,
     DeliveryReceipt,
     ProductSnapshot,
+    ProjectionReceipt,
     RunResult,
     RunStatus,
 )
 from .reporting import build_digest, write_reports
 from .storage import StateStore
+from .feishu_base import FeishuBaseClient, FeishuBaseError, FeishuBaseSetup
+from .projection import FeishuBaseProjection, ProjectionAdapter
 
 
 DEFAULT_FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures"
@@ -208,11 +211,92 @@ def _delivery(
     return MockDeliveryAdapter()
 
 
+def _projection_enabled(config: ProjectConfig) -> bool:
+    return bool(
+        config.feishu_base
+        and config.feishu_base.enabled
+        and config.feishu_base.sync_every_run
+        and config.adapters.projection == "feishu-base"
+    )
+
+
+def _owned_base_client(client: object | None) -> tuple[object, bool]:
+    return (client, False) if client is not None else (FeishuBaseClient(), True)
+
+
+def _close_client(client: object, owned: bool) -> None:
+    if owned and hasattr(client, "close"):
+        client.close()
+
+
+def _attach_projection(digest, receipt, projection: object | None):
+    """Attach fresh Base links only; a failed sync never exposes stale links."""
+    links = dict(receipt.resource_links) if receipt and receipt.synced else {}
+    record_links: dict[str, str] = {}
+    if links and projection is not None and hasattr(projection, "competitor_record_links"):
+        record_links = projection.competitor_record_links(product.candidate_id for product in digest.products)
+    links.update({f"record:{candidate_id}": url for candidate_id, url in record_links.items()})
+    return digest.model_copy(update={"base_links": links, "projection": receipt})
+
+
+def base_doctor(
+    config_path: str | Path = "config/project.yaml", *, base_client: object | None = None,
+) -> dict[str, object]:
+    """Read-only Base credential and capability check."""
+    load_dotenv()
+    config = load_config(config_path)
+    client, owned = _owned_base_client(base_client)
+    store = StateStore(config.storage.database)
+    try:
+        store.initialize()
+        result = FeishuBaseSetup(client, config, store).doctor()
+        return {"ok": result.ok, "checks": result.checks, "detail": result.detail}
+    finally:
+        store.close()
+        _close_client(client, owned)
+
+
+def base_setup(
+    config_path: str | Path = "config/project.yaml", *, base_client: object | None = None,
+):
+    """Create/reuse schema then backfill the SQLite projection."""
+    load_dotenv()
+    config = load_config(config_path)
+    client, owned = _owned_base_client(base_client)
+    store = StateStore(config.storage.database)
+    try:
+        store.initialize()
+        setup_receipt = FeishuBaseSetup(client, config, store).setup()
+        receipt = FeishuBaseProjection(client, store).resync()
+        return receipt.model_copy(update={"resource_links": setup_receipt.resource_links, "base_url": setup_receipt.base_url})
+    finally:
+        store.close()
+        _close_client(client, owned)
+
+
+def base_resync(
+    config_path: str | Path = "config/project.yaml", *, base_client: object | None = None,
+):
+    """Replay persisted facts only; source collection is intentionally skipped."""
+    load_dotenv()
+    config = load_config(config_path)
+    client, owned = _owned_base_client(base_client)
+    store = StateStore(config.storage.database)
+    try:
+        store.initialize()
+        return FeishuBaseProjection(client, store).resync()
+    finally:
+        store.close()
+        _close_client(client, owned)
+
+
 def run_pipeline(
     config_path: str | Path = "config/project.yaml",
     fixture: bool = False,
     dry_run: bool = False,
     delivery_adapter: str | DeliveryAdapter | None = None,
+    projection_adapter: ProjectionAdapter | None = None,
+    base_client: object | None = None,
     force_publish: bool = False,
     fixture_root: str | Path = DEFAULT_FIXTURE_ROOT,
 ) -> RunResult:
@@ -232,11 +316,17 @@ def run_pipeline(
             change_count=0,
             errors=[],
         )
-    analyzer = (
-        HttpJsonAnalyzer()
-        if config.adapters.analyzer == "http-json"
-        else HeuristicAnalyzer()
-    )
+    analyzer_diagnostic = ""
+    if fixture:
+        # Fixture mode is a hard offline boundary, independent of parent env.
+        analyzer = HeuristicAnalyzer()
+    else:
+        try:
+            analyzer = build_analyzer(config.adapters.analyzer)
+        except (RuntimeError, ValueError):
+            # Deterministic extraction remains useful when model env is unavailable.
+            analyzer = HeuristicAnalyzer()
+            analyzer_diagnostic = "model_degraded: analyzer configuration unavailable"
     store = StateStore(config.storage.database)
     store.initialize()
     if not store.acquire_run_lock(config.project.id):
@@ -260,7 +350,7 @@ def run_pipeline(
 
         snapshots: list[ProductSnapshot] = []
         all_events: list[ChangeEvent] = []
-        errors: list[str] = []
+        errors: list[str] = [analyzer_diagnostic] if analyzer_diagnostic else []
         for candidate in candidates:
             if candidate.status.value != "monitored":
                 continue
@@ -273,6 +363,9 @@ def run_pipeline(
                 if not documents:
                     raise ValueError("no official source documents were collected")
                 snapshot = analyzer.analyze(candidate, documents)
+                diagnostic = getattr(analyzer, "last_diagnostic", "")
+                if diagnostic:
+                    errors.append(f"{candidate.name}: {diagnostic}")
                 if not snapshot.evidence:
                     raise ValueError("no evidence-backed structured facts were extracted")
                 previous = store.get_latest_snapshot(candidate.id)
@@ -312,25 +405,56 @@ def run_pipeline(
             report_directory,
         )
 
+        preliminary = RunResult(
+            run_id=run_id,
+            status=RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+            candidate_count=len(candidates), snapshot_count=len(snapshots),
+            change_count=len(confirmed_events), digest=digest, errors=errors,
+        )
+        # SQLite is written before optional remote projection or webhook delivery.
+        store.finish_run(preliminary)
+        projection_receipt = None
+        projection: ProjectionAdapter | None = projection_adapter
+        client: object | None = None
+        owned_client = False
+        if _projection_enabled(config) and (not fixture or projection_adapter is not None):
+            if projection is None:
+                client, owned_client = _owned_base_client(base_client)
+                projection = FeishuBaseProjection(client, store)
+            try:
+                projection_receipt = projection.sync(preliminary)
+                if not projection_receipt.synced:
+                    errors.append("Base sync deferred; retry queued.")
+            except (FeishuBaseError, RuntimeError, OSError) as exc:
+                errors.append(f"Base sync deferred: {type(exc).__name__}.")
+                projection_receipt = ProjectionReceipt(
+                    adapter="feishu-base", synced=False, detail="Base sync deferred; retry queued."
+                )
+            finally:
+                if client is not None:
+                    _close_client(client, owned_client)
+            digest = _attach_projection(digest, projection_receipt, projection)
+
         receipt: DeliveryReceipt | None = None
         should_publish = force_publish or first_run or bool(confirmed_events)
         if should_publish and not dry_run:
-            receipt = _delivery(config, delivery_adapter).publish(digest)
+            # Fixtures are an offline contract: inherited workstation webhook
+            # variables never change their transport unless a test injects one.
+            selected_delivery = delivery_adapter if delivery_adapter is not None else ("mock" if fixture else None)
+            receipt = _delivery(config, selected_delivery).publish(digest)
             if not receipt.delivered:
                 errors.append(f"Delivery: {receipt.detail}")
 
-        status = RunStatus.PARTIAL if errors else RunStatus.SUCCESS
         result = RunResult(
             run_id=run_id,
-            status=status,
+            status=RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
             started_at=started_at,
             finished_at=datetime.now(UTC),
-            candidate_count=len(candidates),
-            snapshot_count=len(snapshots),
-            change_count=len(confirmed_events),
-            digest=digest,
-            delivery=receipt,
-            errors=errors,
+            candidate_count=len(candidates), snapshot_count=len(snapshots),
+            change_count=len(confirmed_events), digest=digest, delivery=receipt,
+            projection=projection_receipt, errors=errors,
         )
         store.finish_run(result)
         return result

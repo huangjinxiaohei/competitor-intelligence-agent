@@ -1,164 +1,55 @@
-# 竞品资料循环 Agent
+# 竞品情报循环 Agent
 
-这是一个无前端、可移植的同行竞品资料 Agent。它按照固定管线完成候选发现、官网采集、字段抽取、证据校验、历史快照、差异检测、报告导出和协作平台消息推送。
+这是一个无前端、可移植的竞品情报 Agent。SQLite 是事实库；飞书 Base 是可重建的可视化投影；群机器人只负责首轮基线和已确认变化的提醒。
 
-默认配置面向“Agent 工具与平台”示例行业，不硬编码真实竞品。没有外部资料或凭据时，可以先使用内置网页夹具完成三轮闭环验证。
-
-## 核心流程
-
-```text
-发现 → 官网归一化 → 竞品评分 → 页面采集 → 字段抽取 → 证据校验
-     → 快照入库 → 差异检测 → 摘要生成 → 推送
-```
-
-- 搜索摘要只用于发现候选，正式结论来自官网、定价页、官方文档或官方文本型 PDF。
-- SQLite 保存候选、来源、快照、变化、运行日志和推送回执。
-- 每轮运行导出 Markdown、JSON 和 CSV 报告。
-- 首轮建立基线并生成全景摘要；后续仅在价格、可用性、关键参数或配置发生有效变化时推送。
-- 字段连续两轮缺失才确认删除；单个来源采集失败时保留上次有效快照。
-- 运行锁阻止同一项目并发执行。
-
-## 安装
-
-需要 Python 3.11 或更高版本。
+## 快速开始
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[test,browser]"
-python -m playwright install chromium
 Copy-Item .env.example .env
+Copy-Item config/project.example.yaml config/project.yaml
 ```
 
-`.env` 只用于本地 CLI 和适配器凭据，已被 Git 忽略。凭据不会写入 YAML 或代码。
-
-## 常用命令
-
-安装项目后可以使用命令入口：
-
-```powershell
-competitor-agent doctor --fixture
-competitor-agent discover --fixture --dry-run
-competitor-agent run --fixture
-competitor-agent report RUN_ID
-competitor-agent push-test --fixture
-```
-
-也可以直接通过 Python 模块运行：
+编辑 `config/project.yaml` 中的行业主题、关键词与 `seed_urls`，运行完整三轮夹具验收：
 
 ```powershell
 .\.venv\Scripts\python.exe -m competitor_agent.cli doctor --fixture
 .\.venv\Scripts\python.exe -m competitor_agent.cli run --fixture
+.\.venv\Scripts\python.exe -m competitor_agent.cli run --fixture
+.\.venv\Scripts\python.exe -m competitor_agent.cli run --fixture
 ```
 
-- `doctor`：检查配置、夹具和消息适配器是否就绪。
-- `discover`：只执行候选发现和评分。
-- `run`：执行完整采集、分析、存储、报告与推送管线。
-- `report RUN_ID`：读取指定运行的 Markdown 报告。
-- `push-test`：强制使用内存模拟适配器验证消息发布链路。
-- `--dry-run`：执行分析但跳过消息发布；非夹具完整运行时只返回发现结果。
+预期：第 1 轮建立基线并发送一次提醒；第 2 轮结构化价格、配置变化再发一次；第 3 轮无变化，群机器人 0 次调用。所有夹具命令使用 mock 适配器。
 
-## 三轮夹具闭环
+## 飞书 Base 投影
 
-`fixtures/manifest.json` 定义了三个连续轮次：
-
-1. `round_01_baseline`：建立价格和配置基线。
-2. `round_02_changed`：包含价格、功能、配置及纯文案变化，只报告有效字段变化。
-3. `round_03_changed`：结构化字段与第二轮相同，用于验证排版和文案变化不会误报。
-
-在同一工作区连续执行：
+1. 在飞书开放平台创建自建应用，开通 Bitable 与协作者权限，将应用机器人加入目标群。
+2. 在 `.env` 写入 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、可选 `FEISHU_OWNER_EMAIL` 和 `FEISHU_VIEWER_CHAT_ID`。凭据不写入 YAML。
+3. 在 YAML 设置 `adapters.projection: feishu-base` 与 `feishu_base.enabled: true`，再运行：
 
 ```powershell
-competitor-agent run --fixture
-competitor-agent run --fixture
-competitor-agent run --fixture
+.\.venv\Scripts\python.exe -m competitor_agent.cli base-doctor --config config/project.yaml
+.\.venv\Scripts\python.exe -m competitor_agent.cli base-setup --config config/project.yaml
+.\.venv\Scripts\python.exe -m competitor_agent.cli run --config config/project.yaml
 ```
 
-SQLite 数据库默认写入 `state/competitive_intel.db`，Markdown、JSON 和 CSV 报告默认写入 `reports/YYYY-MM-DD/`。
+`base-doctor` 只读检查凭据和权限；`base-setup` 幂等创建并回填本地事实；`base-resync` 仅重放 SQLite 投影，不重新采集官网。
 
-若想从第一轮重新开始，请在确认不再需要历史数据后删除本地 `state/` 和 `reports/` 运行产物；这两个目录默认不会提交到 Git。
+Base 包含四张表：竞品主表、套餐价格表、变化事件表、运行日志表；并创建竞品总览、竞品卡片、低置信度、价格对比、本周变化、高优先级变化、指标总览、采集异常、运行历史 9 个视图。投影是单向的：Agent 只写机器字段，保留人工关注级别、标签和备注。
 
-## 接入宿主搜索 Agent
+每轮都先落本地快照和报告，再同步 Base。Base 失败会使运行标为 partial 并写入重试 outbox；已确认的变化仍会带官方证据提醒，不会带过期 Base 链接。
 
-先在 `config/project.yaml` 中设置行业主题、关键词和可选的 `seed_urls`。具备联网搜索能力的宿主 Agent 将结果写入：
+## 模型与采集
 
-```text
-state/host_search_results.json
-```
+每个竞品最多采集 6 个同注册域公开页面，优先定价、产品、功能、文档和安全页。`hybrid-openai` 先使用规则提取明确数字价格，再用 OpenAI 兼容模型补齐套餐语义、配置和中文摘要。模型超时、限流或证据不匹配时自动降级为规则结果并在运行日志标注。
 
-支持简单 JSON 数组：
-
-```json
-[
-  {
-    "title": "Candidate",
-    "url": "https://candidate.example",
-    "snippet": "agent platform pricing"
-  }
-]
-```
-
-也支持按关键词分组：
-
-```json
-{
-  "agent platform": [
-    {
-      "title": "Candidate",
-      "url": "https://candidate.example",
-      "snippet": "agent platform pricing"
-    }
-  ]
-}
-```
-
-随后执行 `competitor-agent discover` 或 `competitor-agent run`。正式采集、证据校验、快照、差异、报告和发布仍由确定性 Python 管线完成。
-
-## 接入外部模型
-
-默认 `adapters.analyzer: heuristic` 使用本地启发式抽取。若要使用兼容 JSON 的模型服务，将 YAML 配置改为 `http-json`，并在 `.env` 中设置：
-
-```dotenv
-MODEL_API_URL=https://model-endpoint.example/v1/extract
-MODEL_API_KEY=...
-MODEL_NAME=...
-```
-
-模型响应必须符合 `schemas/ProductSnapshot.schema.json`。确定性管线会校验结构、来源 URL 和 Evidence，拒绝缺少官方证据的字段。
-
-## 接入协作平台机器人
-
-在 `config/project.yaml` 中将 `adapters.delivery` 设置为 `webhook`，或通过环境变量覆盖：
-
-```dotenv
-DELIVERY_ADAPTER=webhook
-DELIVERY_WEBHOOK_URL=https://collaboration-webhook.example/...
-```
-
-发布结果会保存为 `DeliveryReceipt`。增量消息最多展示 5 条重点变化，其余内容保存在完整报告中。
-
-## 定时运行
-
-安装脚本默认只展示计划，显式传入 `-Apply` 才会注册或删除 Windows 定时任务：
+## 开发验收
 
 ```powershell
-.\scripts\install_schedule.ps1
-.\scripts\install_schedule.ps1 -Apply
-.\scripts\uninstall_schedule.ps1
-.\scripts\uninstall_schedule.ps1 -Apply
-```
-
-默认每天 09:00 运行。Windows 任务计划程序使用计算机当前时区；若要按北京时间执行，请将系统时区设置为 `Asia/Shanghai` 对应时区。
-
-## 测试与质量检查
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest --cov=competitor_agent --cov-report=term-missing
+.\.venv\Scripts\python.exe -m pytest --cov=competitor_agent --cov-fail-under=85
 .\.venv\Scripts\python.exe -m compileall -q src tests
 ```
 
-项目要求核心模块覆盖率不低于 85%。跨宿主数据契约位于 `schemas/`，宿主任务约定见 `agent/contract.md`。
-
-## 飞书竞品概览推送
-
-飞书卡片最多展示 5 个竞品概览。每个概览包含最多 5 项功能、3 条价格、3 项配置、置信度以及 2 个证据链接。缺失的抽取字段显示为“暂未识别”。除非新增托管适配器，完整报告仅保留在本地。
+跨版本迁移：稳定竞品 ID 按注册域生成，旧 ID 映射、快照、变化与缺失计数会一起迁移。

@@ -202,7 +202,7 @@ def test_pipeline_confirms_structured_deletion_on_second_missing_round(
 
 
 
-def test_pipeline_selects_configured_http_json_analyzer(tmp_path: Path, monkeypatch) -> None:
+def test_fixture_pipeline_forces_offline_heuristic_analyzer(tmp_path: Path, monkeypatch) -> None:
     from competitor_agent.analyzer import analyze_documents
 
     config_path = _config(tmp_path)
@@ -216,7 +216,7 @@ def test_pipeline_selects_configured_http_json_analyzer(tmp_path: Path, monkeypa
             calls.append(candidate.id)
             return analyze_documents(candidate, documents)
 
-    monkeypatch.setattr("competitor_agent.pipeline.HttpJsonAnalyzer", FakeHttpAnalyzer)
+    monkeypatch.setattr("competitor_agent.pipeline.build_analyzer", lambda _name: FakeHttpAnalyzer())
     result = run_pipeline(
         config_path,
         fixture=True,
@@ -224,4 +224,5 @@ def test_pipeline_selects_configured_http_json_analyzer(tmp_path: Path, monkeypa
     )
 
     assert result.snapshot_count == 2
-    assert len(calls) == 2
+    # Fixture mode deliberately ignores configured/parent model transports.
+    assert calls == []

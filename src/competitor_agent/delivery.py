@@ -71,39 +71,18 @@ def _price_text(product: DigestProduct) -> str:
     return "; ".join(values)
 
 
-def _product_block(product: DigestProduct) -> str:
+def _product_block(product: DigestProduct, base_record_url: str | None = None) -> str:
     features = "; ".join(_truncate(feature, _MAX_FEATURE_LENGTH) for feature in product.features) or _UNKNOWN
-    configurations = (
-        "; ".join(
-            f"{_truncate(key, _MAX_CONFIG_KEY_LENGTH)}={_truncate(value, _MAX_CONFIG_VALUE_LENGTH)}"
-            for key, value in product.configurations.items()
-        )
-        or _UNKNOWN
-    )
-    evidence = (
-        " ".join(
-            _display_url(url, f"\u6765\u6e90{index}", _EVIDENCE_URL_TOO_LONG)
-            for index, url in enumerate(product.evidence_urls, start=1)
-        )
-        or _UNKNOWN
-    )
+    configurations = "; ".join(f"{_truncate(key, _MAX_CONFIG_KEY_LENGTH)}={_truncate(value, _MAX_CONFIG_VALUE_LENGTH)}" for key, value in product.configurations.items()) or _UNKNOWN
+    evidence = " ".join(_display_url(url, f"\u6765\u6e90{index}", _EVIDENCE_URL_TOO_LONG) for index, url in enumerate(product.evidence_urls, start=1)) or _UNKNOWN
     name = _truncate(product.name, _MAX_NAME_LENGTH)
     heading = _display_url(product.homepage, name, _HOME_URL_TOO_LONG)
-    if heading == _HOME_URL_TOO_LONG:
-        heading = f"### {name}\n{heading}"
-    else:
-        heading = f"### {heading}"
+    heading = f"### {heading}" if heading != _HOME_URL_TOO_LONG else f"### {name}\n{heading}"
     confidence = f"{product.confidence:.0%}" if product.confidence > 0 else _UNKNOWN
-    return "\n".join(
-        [
-            heading,
-            f"**\u6838\u5fc3\u529f\u80fd**\uFF1A{features}",
-            f"**\u5957\u9910\u4ef7\u683c**\uFF1A{_price_text(product)}",
-            f"**\u5173\u952e\u914d\u7f6e**\uFF1A{configurations}",
-            f"**\u7f6e\u4fe1\u5ea6**\uFF1A{confidence}",
-            f"**\u5b98\u65b9\u8bc1\u636e**\uFF1A{evidence}",
-        ]
-    )
+    lines = [heading, f"**\u6838\u5fc3\u529f\u80fd**\uff1a{features}", f"**\u5957\u9910\u4ef7\u683c**\uff1a{_price_text(product)}", f"**\u5173\u952e\u914d\u7f6e**\uff1a{configurations}", f"**\u7f6e\u4fe1\u5ea6**\uff1a{confidence}", f"**\u5b98\u65b9\u8bc1\u636e**\uff1a{evidence}"]
+    if base_record_url:
+        lines.append(f"**Base\u8bb0\u5f55**\uff1a{_display_url(base_record_url, 'Base\u8bb0\u5f55', _EVIDENCE_URL_TOO_LONG)}")
+    return "\n".join(lines)
 
 
 def _change_line(change: ChangeEvent) -> str:
@@ -174,9 +153,19 @@ def render_payload(digest: Digest) -> dict:
         {"tag": "markdown", "content": _truncate(digest.summary, _MAX_SUMMARY_LENGTH)},
     ]
     elements.extend(
-        {"tag": "markdown", "content": _product_block(product)}
+        {"tag": "markdown", "content": _product_block(product, digest.base_links.get(f"record:{product.candidate_id}"))}
         for product in digest.products[:5]
     )
+    if digest.base_links:
+        preferred = ("\u7ade\u54c1\u603b\u89c8", "\u672c\u5468\u53d8\u5316", "\u4ef7\u683c\u5bf9\u6bd4")
+        links = " \u00b7 ".join(
+            _display_url(digest.base_links[label], label, _EVIDENCE_URL_TOO_LONG)
+            for label in preferred if digest.base_links.get(label)
+        )
+        if links:
+            elements.append({"tag": "markdown", "content": f"**\u98de\u4e66 Base**\uff1a{links}"})
+    elif digest.projection is not None and not digest.projection.synced:
+        elements.append({"tag": "markdown", "content": "**Base\u540c\u6b65\u5f85\u91cd\u8bd5**\uff1a\u672c\u6b21\u7ed3\u8bba\u4ecd\u53ef\u901a\u8fc7\u5b98\u65b9\u8bc1\u636e\u6838\u9a8c\u3002"})
     confirmed_changes = [change for change in digest.changes if change.confirmed]
     if confirmed_changes:
         elements.append({"tag": "markdown", "content": "**\u91cd\u70b9\u53d8\u5316**"})

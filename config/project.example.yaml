@@ -1,0 +1,23 @@
+project:
+  id: project-management-saas-example
+  topic: 项目管理 SaaS
+  keywords:
+    - 项目管理
+    - 协作软件
+    - project management pricing
+  seed_urls: []
+collection:
+  max_pages_per_candidate: 6
+adapters:
+  search: host
+  analyzer: heuristic # heuristic | hybrid-openai | http-json
+  delivery: mock      # mock | webhook
+  projection: feishu-base # mock | feishu-base
+feishu_base:
+  enabled: true
+  base_name: 项目管理 SaaS 竞品情报
+  manifest_path: state/project-management-saas-example.feishu-base.json
+  sync_every_run: true
+storage:
+  database: state/project-management-saas-example.db
+  reports_dir: reports/project-management-saas-example

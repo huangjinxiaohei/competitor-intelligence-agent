@@ -99,6 +99,24 @@ def run(
     _emit(_invoke_pipeline("run_pipeline", **_common_options(config, fixture, dry_run)))
 
 
+@app.command(name="base-doctor")
+def base_doctor(config: Path = typer.Option(DEFAULT_CONFIG, "--config")) -> None:
+    """Read-only Feishu Base credential and access capability checks."""
+    _emit(_invoke_pipeline("base_doctor", config_path=config))
+
+
+@app.command(name="base-setup")
+def base_setup(config: Path = typer.Option(DEFAULT_CONFIG, "--config")) -> None:
+    """Create/reuse Base schema and backfill persisted SQLite facts."""
+    _emit(_invoke_pipeline("base_setup", config_path=config))
+
+
+@app.command(name="base-resync")
+def base_resync(config: Path = typer.Option(DEFAULT_CONFIG, "--config")) -> None:
+    """Replay local SQLite facts to Base without source collection."""
+    _emit(_invoke_pipeline("base_resync", config_path=config))
+
+
 @app.command()
 def report(
     run_id: str = typer.Argument(..., help="Existing run identifier."),

@@ -70,9 +70,8 @@ def price_key(candidate_id: str, tier: Any) -> str:
     A named monthly and yearly variant gets a distinct key through ``period``;
     qualifiers distinguish otherwise identical negotiated or regional variants.
     """
-    qualifiers = "|".join(sorted(str(item).strip().casefold() for item in tier.qualifiers))
     parts = (candidate_id, tier.name.strip().casefold(), (tier.period or "").strip().casefold(),
-             (tier.unit or "").strip().casefold(), qualifiers)
+             (tier.unit or "").strip().casefold())
     return "price:" + hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:24]
 
 
@@ -148,8 +147,8 @@ class FeishuBaseProjection:
     @staticmethod
     def _view_resources() -> tuple[str, ...]:
         return (
-            "view:competitors:????", "view:changes:????",
-            "view:pricing:????", "view:runs:????",
+            "view:competitors:\u7ade\u54c1\u603b\u89c8", "view:changes:\u672c\u5468\u53d8\u5316",
+            "view:pricing:\u4ef7\u683c\u5bf9\u6bd4", "view:runs:\u8fd0\u884c\u5386\u53f2",
         )
 
     def _receipt(self, synced: bool, count: int, detail: str) -> ProjectionReceipt:
@@ -184,9 +183,14 @@ class FeishuBaseProjection:
         ])
 
     def _price_fields(self, key: str, tier: Any, snapshot: ProductSnapshot, competitor_record_id: str) -> dict[str, Any]:
-        qualifiers = list(tier.qualifiers)
+        qualifiers = [
+            "\u8054\u7cfb\u9500\u552e"
+            if str(item).strip().casefold().replace("-", " ") in {"contact sales", "contact sale"}
+            else str(item)
+            for item in tier.qualifiers
+        ]
         if tier.amount is None and not qualifiers:
-            qualifiers = ["联系销售" if tier.name else "暂未识别"]
+            qualifiers = ["\u6682\u672a\u8bc6\u522b"]
         fields: dict[str, Any] = {
             _field("pricing", "key"): key,
             _field("pricing", "competitor"): [competitor_record_id],

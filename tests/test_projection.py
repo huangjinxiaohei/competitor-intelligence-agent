@@ -6,6 +6,7 @@ from competitor_agent.models import (
     Candidate, CandidateStatus, ChangeEvent, ChangeImportance, Evidence,
     PriceTier, ProductSnapshot, RunResult, RunStatus,
 )
+from competitor_agent.feishu_base import TABLES
 from competitor_agent.projection import FeishuBaseProjection, price_key
 from competitor_agent.storage import StateStore
 
@@ -48,11 +49,11 @@ def candidate(index: int = 1) -> Candidate:
                      category="saas", score=.8, reasons=["match"], status=CandidateStatus.MONITORED)
 
 
-def snapshot(index: int = 1, amount: float | None = 10) -> ProductSnapshot:
+def snapshot(index: int = 1, amount: float | None = 10, qualifiers: list[str] | None = None) -> ProductSnapshot:
     evidence = Evidence(source_url=f"https://acme{index}.test/pricing", excerpt="Pro monthly $10", observed_at=NOW)
     return ProductSnapshot(candidate_id=f"candidate-{index}", observed_at=NOW, summary="A summary",
                            features=["Board", "Duplicate footer"], configurations={"seats": 5},
-                           pricing=[PriceTier(name="Pro", amount=amount, currency="USD", period="month", unit="seat")],
+                           pricing=[PriceTier(name="Pro", amount=amount, currency="USD", period="month", unit="seat", qualifiers=qualifiers or [])],
                            confidence=.9, evidence=[evidence])
 
 
@@ -76,6 +77,7 @@ def test_resync_is_idempotent_preserves_human_fields_and_price_amount_updates(tm
         projection = FeishuBaseProjection(api, store)
         first = projection.resync()
         assert first.synced and first.records_synced == 3
+        assert first.resource_links["\u7ade\u54c1\u603b\u89c8"] == "https://base.test/overview"
         competitor = next(iter(api.records["tc"].values()))
         competitor["fields"]["人工关注级别"] = "critical"
         # Same tier identity, updated amount: update existing row rather than create a duplicate.
@@ -141,5 +143,22 @@ def test_price_key_distinguishes_period_but_not_amount() -> None:
     monthly = PriceTier(name="Pro", amount=10, period="month", unit="seat")
     changed = PriceTier(name="Pro", amount=12, period="month", unit="seat")
     annual = PriceTier(name="Pro", amount=100, period="year", unit="seat")
+    qualifier_changed = PriceTier(name="Pro", amount=10, period="month", unit="seat", qualifiers=["annual promotion"])
     assert price_key("c", monthly) == price_key("c", changed)
+    assert price_key("c", monthly) == price_key("c", qualifier_changed)
     assert price_key("c", monthly) != price_key("c", annual)
+
+
+def test_missing_numeric_price_is_explicitly_labeled_without_guessing(tmp_path) -> None:
+    with StateStore(tmp_path / "state.sqlite") as store:
+        projection = FeishuBaseProjection(FakeBase(), store)
+        sales = PriceTier(name="Enterprise", amount=None, qualifiers=["contact-sales"])
+        unknown = PriceTier(name="Custom", amount=None)
+        sales_fields = projection._price_fields("one", sales, snapshot(), "rec-competitor")
+        unknown_fields = projection._price_fields("two", unknown, snapshot(), "rec-competitor")
+        # Use the declared Base field order so this test remains encoding-neutral.
+        ordered = next(table for table in TABLES if table.key == "pricing").fields
+        amount, qualifiers = ordered[3].name, ordered[7].name
+        assert sales_fields[amount] is None
+        assert sales_fields[qualifiers] == "\u8054\u7cfb\u9500\u552e"
+        assert unknown_fields[qualifiers] == "\u6682\u672a\u8bc6\u522b"

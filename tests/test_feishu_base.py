@@ -387,8 +387,7 @@ def test_restart_after_base_creation_resumes_marked_default_table(tmp_path: Path
     store = StateStore(tmp_path / "state.db")
     store.initialize()
     store.set_projection_resource("base", "app-restarted", "https://feishu.cn/base/app-restarted")
-    store.set_projection_resource("setup:initial_table", "tbl-default")
-    store.set_projection_resource("setup:phase", "base-created")
+    store.set_projection_resource("setup:phase", "base-created", "app-restarted")
     receipt = FeishuBaseSetup(client(handler), config(tmp_path), store, owner_email="", viewer_chat_id="").setup()
     assert receipt.synced
     assert len(tables) == 4
@@ -399,6 +398,111 @@ def test_restart_after_base_creation_resumes_marked_default_table(tmp_path: Path
     for spec in TABLES:
         table_id = next(table["table_id"] for table in tables if table["name"] == spec.name)
         assert {field["field_name"] for field in fields[table_id]} == {field.name for field in spec.fields}
+    store.close()
+
+
+def test_create_then_first_list_failure_reuses_marked_base_on_retry(tmp_path: Path) -> None:
+    tables = [{"table_id": "tbl-default", "name": "Default blank table"}]
+    fields: dict[str, list[dict]] = {
+        "tbl-default": [{"field_id": "fld-default", "field_name": "Default field", "type": 1, "is_primary": True}]
+    }
+    views: dict[str, list[dict]] = {"tbl-default": []}
+    calls: list[tuple[str, str]] = []
+    fail_first_list = [True]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content or b"{}")
+        calls.append((request.method, path))
+        if path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.method == "POST" and path == "/open-apis/bitable/v1/apps":
+            return response({"app": {"app_token": "app-crash", "url": "https://feishu.cn/base/app-crash"}})
+        if request.method == "GET" and path.endswith("/apps/app-crash/tables"):
+            if fail_first_list[0]:
+                return httpx.Response(503)
+            return response({"items": tables, "has_more": False})
+        if request.method == "PATCH" and path.endswith("/tables/tbl-default"):
+            tables[0]["name"] = body["name"]
+            return response({"table": tables[0]})
+        if request.method == "POST" and path.endswith("/tables"):
+            table_id = f"tbl-{len(tables) + 1}"
+            tables.append({"table_id": table_id, "name": body["table"]["name"]})
+            fields[table_id] = [{"field_id": f"fld-{table_id}", "field_name": "Default field", "type": 1, "is_primary": True}]
+            views[table_id] = []
+            return response({"table_id": table_id})
+        if request.method == "GET" and path.endswith("/fields"):
+            return response({"items": fields[path.split("/")[-2]], "has_more": False})
+        if request.method == "PUT" and "/fields/" in path:
+            table_id, field_id = path.split("/")[-3], path.split("/")[-1]
+            field = next(row for row in fields[table_id] if row["field_id"] == field_id)
+            field["field_name"] = body["field_name"]
+            return response({"field": field})
+        if request.method == "POST" and path.endswith("/fields"):
+            table_id = path.split("/")[-2]
+            field = {"field_id": f"fld-{len(fields[table_id]) + 1}", **body}
+            fields[table_id].append(field)
+            return response({"field": field})
+        if request.method == "GET" and path.endswith("/views"):
+            return response({"items": views[path.split("/")[-2]], "has_more": False})
+        if request.method == "POST" and path.endswith("/views"):
+            table_id = path.split("/")[-2]
+            view = {"view_id": f"vew-{len(views[table_id]) + 1}", **body}
+            views[table_id].append(view)
+            return response({"view": view})
+        raise AssertionError(f"{request.method} {path}")
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    first_client = FeishuBaseClient(
+        app_id="app-id",
+        app_secret="app-secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler), base_url=API),
+        max_retries=0,
+    )
+    with pytest.raises(FeishuBaseError):
+        FeishuBaseSetup(first_client, config(tmp_path), store, owner_email="", viewer_chat_id="").setup()
+    assert store.get_projection_resource("base") == "app-crash"
+    assert store.get_projection_resource("setup:phase") == "base-created"
+    assert store.get_projection_resource_link("setup:phase") == "app-crash"
+    assert store.get_projection_resource("setup:initial_table") is None
+
+    fail_first_list[0] = False
+    receipt = FeishuBaseSetup(client(handler), config(tmp_path), store, owner_email="", viewer_chat_id="").setup()
+    assert receipt.synced
+    assert len(tables) == 4
+    assert sum(method == "POST" and path == "/open-apis/bitable/v1/apps" for method, path in calls) == 1
+    assert store.get_projection_resource("setup:phase") == "complete"
+    assert store.get_projection_resource_link("setup:phase") == "app-crash"
+    store.close()
+
+
+def test_manifest_fallback_ignores_phase_metadata_for_another_base(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.url.path.endswith("/apps/app-stale/tables"):
+            return httpx.Response(404, json={"code": 1254040, "msg": "missing"})
+        if request.url.path.endswith("/apps/app-other/tables"):
+            return response({"items": [{"table_id": "tbl-other", "name": "Mature table"}], "has_more": False})
+        raise AssertionError(request.url.path)
+
+    settings = config(tmp_path)
+    Path(settings.feishu_base.manifest_path).write_text(
+        json.dumps({"base": {"id": "app-other", "url": "https://feishu.cn/base/app-other"}}),
+        encoding="utf-8",
+    )
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.set_projection_resource("base", "app-stale")
+    store.set_projection_resource("setup:phase", "base-created", "app-stale")
+    store.set_projection_resource("setup:initial_table", "tbl-stale", "app-stale")
+    setup = FeishuBaseSetup(client(handler), settings, store)
+    app_token, _, tables = setup._ensure_base("ignored")
+    assert app_token == "app-other"
+    assert setup._capture_initial_table(app_token, tables) is None
+    assert store.get_projection_resource("base") == "app-other"
+    assert store.get_projection_resource_link("setup:phase") == "app-stale"
     store.close()
 
 def test_replay_never_renames_an_arbitrary_existing_table(tmp_path: Path) -> None:

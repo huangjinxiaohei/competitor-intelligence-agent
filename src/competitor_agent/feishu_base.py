@@ -422,13 +422,15 @@ class FeishuBaseSetup:
         if not settings.enabled:
             raise FeishuBaseError("Feishu Base projection is disabled in configuration.")
         app_token, base_url, existing_tables = self._ensure_base(settings.base_name)
-        initial_table_id = self._initial_table_id()
+        initial_table_id = self._capture_initial_table(app_token, existing_tables)
         table_ids = self._ensure_tables(app_token, initial_table_id=initial_table_id, existing_tables=existing_tables)
-        self._ensure_fields(app_token, table_ids, allow_primary_rename=self._setup_phase_is_initial())
+        self._ensure_fields(app_token, table_ids, allow_primary_rename=initial_table_id is not None)
+        # All initial table and primary-field migrations are complete; future
+        # replays must treat this Base as mature before creating views/permissions.
+        self.store.set_projection_resource("setup:phase", "complete", app_token)
         view_links = self._ensure_views(app_token, table_ids, base_url)
         self._ensure_permissions(app_token)
         self._write_manifest(app_token, base_url, table_ids, view_links)
-        self.store.set_projection_resource("setup:phase", "complete")
         return ProjectionReceipt(adapter="feishu-base", synced=True, base_url=base_url, resource_links=view_links, detail="Base schema is ready.")
 
     def _ensure_base(self, name: str) -> tuple[str, str, list[dict[str, Any]]]:
@@ -462,23 +464,39 @@ class FeishuBaseSetup:
             raise FeishuBaseError("Feishu Base creation response did not contain app_token.", operation="Base creation")
         base_url = app.get("url") if isinstance(app, dict) else None
         base_url = base_url if isinstance(base_url, str) and base_url else f"https://feishu.cn/base/{app_token}"
-        # Persist the one-table creation phase before any table/field mutation so
-        # a restarted setup can only resume this known initial resource.
+        # This local write precedes the first post-create network call.  It binds
+        # a recoverable creation phase to exactly this newly returned app token.
+        self.store.set_projection_resource("setup:phase", "base-created", app_token)
         self.store.set_projection_resource("base", app_token, base_url)
         existing_tables = self.client.list_tables(app_token)
-        if len(existing_tables) != 1 or not isinstance(existing_tables[0].get("table_id"), str):
-            raise FeishuBaseError("New Feishu Base did not expose exactly one default table.", operation="Base creation")
-        self.store.set_projection_resource("setup:initial_table", str(existing_tables[0]["table_id"]))
-        self.store.set_projection_resource("setup:phase", "base-created")
+        self._capture_initial_table(app_token, existing_tables)
         return app_token, base_url, existing_tables
 
-    def _setup_phase_is_initial(self) -> bool:
+    def _setup_phase_is_initial(self, app_token: str) -> bool:
         assert self.store is not None
-        return self.store.get_projection_resource("setup:phase") == "base-created"
+        return (
+            self.store.get_projection_resource("setup:phase") == "base-created"
+            and self.store.get_projection_resource_link("setup:phase") == app_token
+        )
 
-    def _initial_table_id(self) -> str | None:
+    def _capture_initial_table(self, app_token: str, existing_tables: list[dict[str, Any]]) -> str | None:
+        """Capture only the known creation-phase default table for this exact Base."""
         assert self.store is not None
-        return self.store.get_projection_resource("setup:initial_table") if self._setup_phase_is_initial() else None
+        if not self._setup_phase_is_initial(app_token):
+            return None
+        stored = self.store.get_projection_resource("setup:initial_table")
+        stored_for = self.store.get_projection_resource_link("setup:initial_table")
+        if stored and stored_for == app_token:
+            if any(table.get("table_id") == stored for table in existing_tables):
+                return stored
+            raise FeishuBaseError("Recorded initial table is missing from the Base.", operation="Base recovery")
+        if len(existing_tables) != 1:
+            raise FeishuBaseError("New Feishu Base did not expose exactly one default table.", operation="Base recovery")
+        table_id = existing_tables[0].get("table_id")
+        if not isinstance(table_id, str) or not table_id:
+            raise FeishuBaseError("New Feishu Base default table is missing an ID.", operation="Base recovery")
+        self.store.set_projection_resource("setup:initial_table", table_id, app_token)
+        return table_id
 
     def _load_manifest_base(self) -> tuple[str | None, str | None]:
         assert self.config is not None and self.config.feishu_base is not None

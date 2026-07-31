@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from competitor_agent.config import ProjectConfig
-from competitor_agent.discovery import discover_candidates, score_candidate
+from competitor_agent.discovery import discover_candidates, registrable_domain, score_candidate
 from competitor_agent.adapters.search import SearchResult, StaticSearchProvider
 from competitor_agent.models import Candidate, CandidateStatus, Digest, Evidence, ProductSnapshot, ProjectionReceipt, RunResult, RunStatus
 from competitor_agent.storage import StateStore
@@ -70,6 +70,11 @@ def test_config_adds_collection_page_cap_projection_and_strict_feishu_base() -> 
             "feishu_base": {"base_name": "", "unexpected": "value"},
         })
 
+
+def test_registrable_domain_handles_reserved_suffixes_and_ip_hosts() -> None:
+    assert registrable_domain("https://www.acme.test/pricing") == "acme.test"
+    assert registrable_domain("https://docs.acme.test/features") == "acme.test"
+    assert registrable_domain("http://127.0.0.1:8000") == "127.0.0.1"
 
 def test_discovery_uses_registrable_domain_identity_origin_and_entry_urls() -> None:
     first = score_candidate("Acme", "https://www.acme.co.uk/pricing?utm_source=search", "ai", {"feature_overlap": 1}, config())

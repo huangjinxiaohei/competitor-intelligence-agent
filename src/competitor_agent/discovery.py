@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 from collections.abc import Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -51,9 +52,21 @@ def registrable_domain(url: str) -> str:
     host = (urlsplit(url).hostname or "").lower().rstrip(".")
     if not host:
         return ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return host
     if tldextract is not None:
         extracted = tldextract.TLDExtract(suffix_list_urls=())(host)
-        return extracted.top_domain_under_public_suffix or host
+        if extracted.top_domain_under_public_suffix:
+            return extracted.top_domain_under_public_suffix
+        # Reserved/private fixture suffixes such as `.test` are intentionally
+        # absent from the public suffix list. Treat their last two labels as one
+        # registrable identity so sibling official subdomains still merge.
+        labels = host.split(".")
+        return ".".join(labels[-2:]) if len(labels) >= 2 else host
     # The packaged dependency is preferred. This small fallback keeps existing
     # offline installations operational until dependencies are refreshed.
     labels = host.split(".")

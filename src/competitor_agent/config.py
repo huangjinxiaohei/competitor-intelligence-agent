@@ -49,16 +49,14 @@ class CollectionSettings(ConfigModel):
     per_domain_delay_seconds: float = Field(default=1.0, ge=0)
     max_pdf_megabytes: int = Field(default=20, ge=1)
     browser_fallback: bool = True
-    max_pages_per_candidate: int = Field(default=8, ge=1, le=100)
+    max_pages_per_candidate: int = Field(default=6, ge=1, le=100)
 
 
 class FeishuBaseSettings(ConfigModel):
-    app_token: str = Field(min_length=1)
-    competitors_table: str = Field(min_length=1)
-    snapshots_table: str = Field(min_length=1)
-    changes_table: str = Field(min_length=1)
-    runs_table: str = Field(min_length=1)
-
+    enabled: bool = False
+    base_name: str = Field(default="Competitor Intelligence", min_length=1)
+    manifest_path: str = Field(default="state/feishu_base_manifest.json", min_length=1)
+    sync_every_run: bool = True
 
 class ScheduleSettings(ConfigModel):
     timezone: str = "Asia/Shanghai"

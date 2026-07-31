@@ -223,10 +223,18 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def resolve_candidate_alias(self, candidate_id: str) -> str:
-        row = self._db.execute(
-            "SELECT candidate_id FROM candidate_aliases WHERE alias_id = ?", (candidate_id,)
-        ).fetchone()
-        return str(row["candidate_id"]) if row else candidate_id
+        """Resolve historical IDs through alias rewrites without looping forever."""
+        current = candidate_id
+        seen: set[str] = set()
+        while current not in seen:
+            seen.add(current)
+            row = self._db.execute(
+                "SELECT candidate_id FROM candidate_aliases WHERE alias_id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                return current
+            current = str(row["candidate_id"])
+        return current
 
     def migrate_candidate_identities(self) -> None:
         """Merge legacy URL/name identities into stable registrable-domain IDs.
@@ -252,6 +260,10 @@ class StateStore:
         try:
             database.execute("BEGIN IMMEDIATE")
             for old_id, target_id in rewrites.items():
+                database.execute(
+                    "UPDATE candidate_aliases SET candidate_id = ? WHERE candidate_id = ?",
+                    (target_id, old_id),
+                )
                 database.execute(
                     """INSERT INTO candidate_aliases(alias_id, candidate_id) VALUES (?, ?)
                     ON CONFLICT(alias_id) DO UPDATE SET candidate_id = excluded.candidate_id""",

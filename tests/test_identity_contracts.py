@@ -53,19 +53,21 @@ def test_projection_receipt_and_field_path_evidence_are_serialized() -> None:
 
 def test_config_adds_collection_page_cap_projection_and_strict_feishu_base() -> None:
     defaults = config()
-    assert defaults.collection.max_pages_per_candidate == 8
+    assert defaults.collection.max_pages_per_candidate == 6
     assert defaults.adapters.projection == "mock"
     assert defaults.feishu_base is None
 
     configured = ProjectConfig.model_validate({
         "project": {"id": "demo", "topic": "agent", "keywords": ["agent"]},
-        "feishu_base": {"app_token": "app-token", "competitors_table": "tbl_competitors", "snapshots_table": "tbl_snapshots", "changes_table": "tbl_changes", "runs_table": "tbl_runs"},
+        "feishu_base": {"enabled": True, "base_name": "Competitor Base", "manifest_path": "state/base-manifest.json"},
     })
-    assert configured.feishu_base.app_token == "app-token"
+    assert configured.feishu_base.enabled is True
+    assert configured.feishu_base.base_name == "Competitor Base"
+    assert configured.feishu_base.sync_every_run is True
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate({
             "project": {"id": "demo", "topic": "agent", "keywords": ["agent"]},
-            "feishu_base": {"app_token": "app-token", "unexpected": "value"},
+            "feishu_base": {"base_name": "", "unexpected": "value"},
         })
 
 
@@ -138,6 +140,21 @@ def test_identity_migration_resolves_same_domain_collisions_deterministically(tm
         assert store.resolve_candidate_alias("a") == rows[0]["candidate_id"]
         assert store.resolve_candidate_alias("b") == rows[0]["candidate_id"]
         assert store.get_missing_count(rows[0]["candidate_id"], "summary") == 3
+
+
+def test_aliases_survive_two_consecutive_identity_rewrites(tmp_path, monkeypatch) -> None:
+    with StateStore(tmp_path / "state.sqlite") as store:
+        legacy = legacy_candidate("legacy", "https://www.acme.test/pricing")
+        store.connection.execute("INSERT INTO candidates(candidate_id, payload) VALUES (?, ?)", (legacy.id, legacy.model_dump_json()))
+        store.connection.commit()
+        monkeypatch.setattr("competitor_agent.storage.stable_candidate_id", lambda _: "candidate-first")
+        store.migrate_candidate_identities()
+        monkeypatch.setattr("competitor_agent.storage.stable_candidate_id", lambda _: "candidate-final")
+        store.migrate_candidate_identities()
+
+        assert store.resolve_candidate_alias("legacy") == "candidate-final"
+        assert store.resolve_candidate_alias("candidate-first") == "candidate-final"
+        assert store.resolve_candidate_alias("candidate-final") == "candidate-final"
 
 
 def test_projection_resources_record_mappings_and_outbox_persist(tmp_path) -> None:

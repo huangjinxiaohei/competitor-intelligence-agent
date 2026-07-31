@@ -60,7 +60,7 @@
           "type": "boolean"
         },
         "max_pages_per_candidate": {
-          "default": 8,
+          "default": 6,
           "maximum": 100,
           "minimum": 1,
           "title": "Max Pages Per Candidate",
@@ -113,39 +113,29 @@
     "FeishuBaseSettings": {
       "additionalProperties": false,
       "properties": {
-        "app_token": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "base_name": {
+          "default": "Competitor Intelligence",
           "minLength": 1,
-          "title": "App Token",
+          "title": "Base Name",
           "type": "string"
         },
-        "competitors_table": {
+        "manifest_path": {
+          "default": "state/feishu_base_manifest.json",
           "minLength": 1,
-          "title": "Competitors Table",
+          "title": "Manifest Path",
           "type": "string"
         },
-        "snapshots_table": {
-          "minLength": 1,
-          "title": "Snapshots Table",
-          "type": "string"
-        },
-        "changes_table": {
-          "minLength": 1,
-          "title": "Changes Table",
-          "type": "string"
-        },
-        "runs_table": {
-          "minLength": 1,
-          "title": "Runs Table",
-          "type": "string"
+        "sync_every_run": {
+          "default": true,
+          "title": "Sync Every Run",
+          "type": "boolean"
         }
       },
-      "required": [
-        "app_token",
-        "competitors_table",
-        "snapshots_table",
-        "changes_table",
-        "runs_table"
-      ],
       "title": "FeishuBaseSettings",
       "type": "object"
     },

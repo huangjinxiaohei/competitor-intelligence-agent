@@ -62,14 +62,14 @@ def _add_unique(items: list[str], value: str) -> bool:
 
 
 def _plan_name(raw: str, candidate: Candidate) -> str:
-    name = _normalise(raw).strip(" :-—–")
+    name = _normalise(raw).strip(" :-")
+    name = re.sub(r"\bplan\s+(?:starting\s+at|from)\s*$", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"\bplan\b\s*$", "", name, flags=re.IGNORECASE).strip()
     if name.casefold().startswith(candidate.name.casefold()):
-        name = name[len(candidate.name):].strip(" :-—–")
+        name = name[len(candidate.name):].strip(" :-")
     words = name.split()
-    # A preceding sentence/product name can be swallowed by free-form page text.
+    # A preceding product title can be swallowed by free-form page text.
     return words[-1] if words else "Plan"
-
 
 def _period_and_unit(tail: str) -> tuple[str | None, str | None]:
     lower = tail.casefold()
@@ -96,10 +96,25 @@ def _record_price_evidence(
             _record_evidence(evidence, field_evidence, f"{prefix}.{field}", document, start, end)
 
 
+def _price_qualifiers(intro: str, tail: str) -> list[str]:
+    text = _normalise(f"{intro} {tail}").casefold()
+    qualifiers: list[str] = []
+    if "starting at" in text or text.startswith("from "):
+        qualifiers.append("starting at")
+    if "billed annually" in text or "annual billing" in text:
+        qualifiers.append("billed annually")
+    commitment = re.search(r"\bannual\s+(commitment|contract)(?:\s+(required|only))?", text)
+    if commitment:
+        qualifiers.append(f"annual {commitment.group(1)}" + (" required" if commitment.group(2) == "required" else ""))
+    if re.search(r"\bfree\s+trial\b", text):
+        qualifiers.append("free trial")
+    return qualifiers
+
+
 def _extract_prices(candidate: Candidate, document: SourceDocument, pricing: list[PriceTier], evidence: list[Evidence], field_evidence: dict[str, list[Evidence]]) -> None:
     text = document.text
     price_pattern = re.compile(
-        rf"(?P<name>[A-Z][A-Za-z0-9+ _-]{{0,60}}?)\s+(?:plan\s*[:—–-]?\s*)?(?P<currency>{_CURRENCY_PATTERN})\s*(?P<amount>\d[\d,]*(?:\.\d{{1,2}})?)(?P<tail>(?:\s*(?:per|/|monthly|annual(?:ly)?|daily)[^.!?\n]*)?)",
+        rf"(?P<name>[A-Z][A-Za-z0-9+ _-]{{0,60}}?)\s+(?:plan\s*[:\-\u2014\u2013]?\s*)?(?P<intro>(?:(?:starting\s+at|from)\s+)?)(?P<currency>{_CURRENCY_PATTERN})\s*(?P<amount>\d[\d,]*(?:\.\d{{1,2}})?)(?P<tail>(?:\s*(?:per|/|monthly|annual(?:ly)?|daily)[^.!?\n]*)?)",
         re.IGNORECASE,
     )
     for match in price_pattern.finditer(text):
@@ -108,19 +123,25 @@ def _extract_prices(candidate: Candidate, document: SourceDocument, pricing: lis
             continue
         currency_token = match.group("currency").upper()
         period, unit = _period_and_unit(match.group("tail"))
-        tier = PriceTier(name=name, amount=float(match.group("amount").replace(",", "")), currency=_CURRENCY[currency_token], period=period, unit=unit)
+        tier = PriceTier(
+            name=name,
+            amount=float(match.group("amount").replace(",", "")),
+            currency=_CURRENCY[currency_token],
+            period=period,
+            unit=unit,
+            qualifiers=_price_qualifiers(match.group("intro"), match.group("tail")),
+        )
         if tier not in pricing:
             pricing.append(tier)
             _record_price_evidence(evidence, field_evidence, tier, document, match.start(), match.end())
 
-    contact_pattern = re.compile(r"(?P<name>[A-Z][A-Za-z0-9+ _-]{0,60}?)(?:\s+plan)?\s*[:—–-]?\s*(?:contact|talk to)\s+sales", re.IGNORECASE)
+    contact_pattern = re.compile(r"(?P<name>[A-Z][A-Za-z0-9+ _-]{0,60}?)(?:\s+plan)?\s*[:\-\u2014\u2013]?\s*(?:contact|talk to)\s+sales", re.IGNORECASE)
     for match in contact_pattern.finditer(text):
         name = _plan_name(match.group("name"), candidate)
         tier = PriceTier(name=name, qualifiers=["contact sales"])
         if not any(item.name.casefold() == tier.name.casefold() for item in pricing):
             pricing.append(tier)
             _record_price_evidence(evidence, field_evidence, tier, document, match.start(), match.end())
-
 
 def _confidence(field_evidence: dict[str, list[Evidence]], documents: Sequence[SourceDocument]) -> float:
     fields = len(field_evidence)
@@ -292,7 +313,8 @@ class HybridOpenAIAnalyzer:
         evidence = list(rules.evidence)
 
         def model_evidence(path: str) -> list[Evidence]:
-            return list(model.field_evidence.get(path) or model.evidence)
+            # Generic evidence validates the response only; every merged field needs its own link.
+            return list(model.field_evidence.get(path, []))
 
         def add_field(path: str, items: Sequence[Evidence]) -> None:
             if not items:
@@ -301,40 +323,46 @@ class HybridOpenAIAnalyzer:
             self._extend_unique(bucket, items)
             self._extend_unique(evidence, items)
 
-        if model.summary:
+        summary_evidence = model_evidence("summary")
+        if model.summary and summary_evidence:
             payload["summary"] = model.summary
-            add_field("summary", model_evidence("summary"))
-        for feature in model.features:
-            if feature.casefold() not in {item.casefold() for item in payload["features"]}:
+            add_field("summary", summary_evidence)
+        for index, feature in enumerate(model.features):
+            source_evidence = model_evidence(f"features.{index}")
+            if feature.casefold() not in {item.casefold() for item in payload["features"]} and source_evidence:
                 payload["features"].append(feature)
-                add_field(f"features.{len(payload['features']) - 1}", model_evidence(f"features.{model.features.index(feature)}"))
+                add_field(f"features.{len(payload['features']) - 1}", source_evidence)
         for section in ("specifications", "configurations"):
             for key, value in getattr(model, section).items():
-                if key not in payload[section]:
+                source_evidence = model_evidence(f"{section}.{key}")
+                if key not in payload[section] and source_evidence:
                     payload[section][key] = value
-                    add_field(f"{section}.{key}", model_evidence(f"{section}.{key}"))
-        if payload.get("availability") is None and model.availability:
+                    add_field(f"{section}.{key}", source_evidence)
+        availability_evidence = model_evidence("availability")
+        if payload.get("availability") is None and model.availability and availability_evidence:
             payload["availability"] = model.availability
-            add_field("availability", model_evidence("availability"))
+            add_field("availability", availability_evidence)
         by_name = {item["name"].casefold(): item for item in payload["pricing"]}
         for model_tier in model.pricing:
             key = model_tier.name.casefold()
+            prefix = f"pricing.{_tier_key(model_tier.name)}"
             existing = by_name.get(key)
             if existing is None:
-                if model_tier.amount is None:
-                    tier_payload = model_tier.model_dump(mode="python")
-                    payload["pricing"].append(tier_payload)
-                    by_name[key] = tier_payload
-                    for field in ("name", "currency", "period", "unit", "qualifiers"):
-                        if tier_payload.get(field) not in (None, [], ""):
-                            add_field(f"pricing.{_tier_key(model_tier.name)}.{field}", model_evidence(f"pricing.{_tier_key(model_tier.name)}.{field}"))
-                continue
+                name_evidence = model_evidence(f"{prefix}.name")
+                if model_tier.amount is None and name_evidence:
+                    existing = {"name": model_tier.name, "amount": None, "currency": None, "period": None, "unit": None, "qualifiers": []}
+                    payload["pricing"].append(existing)
+                    by_name[key] = existing
+                    add_field(f"{prefix}.name", name_evidence)
+                else:
+                    continue
             # Amount is deliberately never model-authored. Rules own numeric prices.
             for field in ("currency", "period", "unit", "qualifiers"):
                 value = getattr(model_tier, field)
-                if existing.get(field) in (None, [], "") and value not in (None, [], ""):
+                source_evidence = model_evidence(f"{prefix}.{field}")
+                if existing.get(field) in (None, [], "") and value not in (None, [], "") and source_evidence:
                     existing[field] = value
-                    add_field(f"pricing.{_tier_key(model_tier.name)}.{field}", model_evidence(f"pricing.{_tier_key(model_tier.name)}.{field}"))
+                    add_field(f"{prefix}.{field}", source_evidence)
         payload["evidence"] = evidence
         payload["field_evidence"] = field_evidence
         payload["confidence"] = _confidence(field_evidence, documents)

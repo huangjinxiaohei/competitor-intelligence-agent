@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import heapq
@@ -166,6 +166,9 @@ def _collect_one(candidate: Candidate, url: str, config: ProjectConfig, fixture_
         return None
     response = _request(url, config)
     final_url = canonicalize_url(str(response.url))
+    # Redirect targets are evidence sources too: never admit another registrable domain.
+    if not _same_official_site(final_url, candidate):
+        return None
     content_type = response.headers.get("content-type", "").lower()
     if len(response.content) > config.collection.max_pdf_megabytes * 1024 * 1024:
         raise ValueError(f"Response exceeds maximum collection size: {url}")

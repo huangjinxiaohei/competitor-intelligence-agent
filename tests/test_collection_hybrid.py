@@ -87,11 +87,11 @@ def test_collection_rejects_off_domain_and_caps_fixture_pages(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("fixture_name, expected", [
-    ("cloudbase.html", ("CloudBase", "Starter", 12.0)),
-    ("streamdesk.html", ("StreamDesk", "Team", 24.0)),
-    ("safevault.html", ("SafeVault", "Business", 49.0)),
+    ("cloudbase.html", ("CloudBase", "Starter", 12.0, "billed annually")),
+    ("streamdesk.html", ("StreamDesk", "Team", 24.0, "annual commitment required")),
+    ("safevault.html", ("SafeVault", "Business", 49.0, "starting at")),
 ])
-def test_anonymous_saas_fixtures_extract_clean_pricing_and_field_evidence(fixture_name: str, expected: tuple[str, str, float]) -> None:
+def test_anonymous_saas_fixtures_extract_clean_pricing_and_field_evidence(fixture_name: str, expected: tuple[str, str, float, str]) -> None:
     fixture = Path(__file__).parent / "fixtures" / "anonymous_saas" / fixture_name
     doc = SourceDocument(
         candidate_id="candidate-demo", url=f"fixture://{fixture_name}", title="Fixture",
@@ -99,7 +99,7 @@ def test_anonymous_saas_fixtures_extract_clean_pricing_and_field_evidence(fixtur
         text=fixture.read_text(encoding="utf-8"),
     )
     snapshot = analyze_documents(_candidate(name=expected[0]), [doc])
-    assert any(item.name == expected[1] and item.amount == expected[2] for item in snapshot.pricing)
+    assert any(item.name == expected[1] and item.amount == expected[2] and expected[3] in item.qualifiers for item in snapshot.pricing)
     assert snapshot.features
     assert snapshot.field_evidence
     assert all(snapshot.field_evidence.values())
@@ -122,7 +122,7 @@ def _model_document() -> SourceDocument:
     return SourceDocument(
         candidate_id="candidate-demo", url="https://app.example.test/pricing", title="Pricing",
         fetched_at=datetime.now(UTC), content_hash="c" * 64, source_type=SourceType.HTML,
-        text="Pro plan $29 per month per editor. Configure deployment: cloud. Includes audit logs.",
+        text="Pro plan $29 per month per editor. Configure deployment: cloud. Includes audit logs. Annual billing available. Priority support is included. Advanced reporting is available. Service is offered internationally.",
     )
 
 
@@ -136,19 +136,33 @@ def _configure_model(monkeypatch) -> str:
 
 def _model_snapshot(*, candidate_id: str = "candidate-demo", excerpt: str | None = None, amount: float = 999) -> dict[str, object]:
     document = _model_document()
-    evidence = {"source_url": document.url, "excerpt": excerpt or "Includes audit logs.", "observed_at": document.fetched_at.isoformat()}
+    def evidence(value: str) -> dict[str, str]:
+        return {"source_url": document.url, "excerpt": value, "observed_at": document.fetched_at.isoformat()}
+    price = evidence("Pro plan $29 per month per editor.")
+    feature = evidence("Includes audit logs.")
+    advanced = evidence("Advanced reporting is available.")
+    deployment = evidence("Configure deployment: cloud.")
+    support = evidence("Priority support is included.")
+    availability = evidence("Service is offered internationally.")
+    qualifier = evidence("Annual billing available.")
+    if excerpt is not None:
+        availability = evidence(excerpt)
     return {
         "candidate_id": candidate_id,
         "observed_at": document.fetched_at.isoformat(),
-        "summary": "模型中文摘要",
-        "features": ["audit logs"],
+        "summary": "\u6a21\u578b\u4e2d\u6587\u6458\u8981",
+        "features": ["audit logs", "advanced reporting"],
         "specifications": {},
-        "configurations": {"deployment": "cloud"},
+        "configurations": {"deployment": "cloud", "support": "priority"},
         "pricing": [{"name": "Pro", "amount": amount, "currency": "USD", "period": "month", "unit": "editor", "qualifiers": ["annual billing available"]}],
-        "availability": "全球可用",
+        "availability": "\u5168\u7403\u53ef\u7528",
         "confidence": .99,
-        "evidence": [evidence],
-        "field_evidence": {"availability": [evidence], "pricing.pro.qualifiers": [evidence]},
+        "evidence": [price, feature, advanced, deployment, support, availability, qualifier],
+        "field_evidence": {
+            "summary": [price], "features.0": [feature], "features.1": [advanced],
+            "configurations.deployment": [deployment], "configurations.support": [support],
+            "availability": [availability], "pricing.pro.qualifiers": [qualifier],
+        },
     }
 
 
@@ -202,3 +216,25 @@ def test_hybrid_does_not_adopt_a_model_only_numeric_price(monkeypatch) -> None:
         mock.post(endpoint).mock(return_value=httpx.Response(200, json={"choices": [{"message": {"content": __import__("json").dumps(_model_snapshot())}}]}))
         snapshot = HybridOpenAIAnalyzer().analyze(_candidate(), [document])
     assert snapshot.pricing == []
+
+
+def test_collection_skips_official_url_when_redirected_off_domain(monkeypatch) -> None:
+    from competitor_agent import collector
+
+    redirected = httpx.Response(200, text="external page", request=httpx.Request("GET", "https://evil.test/landing"))
+    monkeypatch.setattr(collector, "_request", lambda *_: redirected)
+    assert collect_candidate(_candidate(), _config()) == []
+
+
+def test_hybrid_omits_model_field_without_direct_field_evidence(monkeypatch) -> None:
+    endpoint = _configure_model(monkeypatch)
+    document = _model_document().model_copy(update={
+        "text": "Pro plan $29 per month per editor. Configure deployment: cloud. Includes audit logs. Annual billing available. Priority support is included. Advanced reporting is available."
+    })
+    payload = _model_snapshot()
+    payload["field_evidence"].pop("availability")
+    payload["evidence"] = [item for item in payload["evidence"] if item["excerpt"] != "Service is offered internationally."]
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(endpoint).mock(return_value=httpx.Response(200, json={"choices": [{"message": {"content": __import__("json").dumps(payload)}}]}))
+        snapshot = HybridOpenAIAnalyzer().analyze(_candidate(), [document])
+    assert snapshot.availability is None

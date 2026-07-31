@@ -22,8 +22,13 @@ class FakeBase:
         self.fail_always = False
         self.short_create_once = False
         self.short_update_table: str | None = None
+        self.fail_list_once = False
 
     def list_records(self, _app: str, table: str) -> list[dict]:
+        if self.fail_list_once:
+            self.fail_list_once = False
+            from competitor_agent.feishu_base import FeishuBaseError
+            raise FeishuBaseError("temporary", operation="projection list")
         return list(self.records[table].values())
 
     def create_records(self, _app: str, table: str, records: list[dict]) -> list[dict]:
@@ -90,6 +95,11 @@ def test_resync_is_idempotent_preserves_human_fields_and_price_amount_updates(tm
         assert first.synced and first.records_synced == 3
         assert first.resource_links["\u7ade\u54c1\u603b\u89c8"] == "https://base.test/overview"
         competitor = next(iter(api.records["tc"].values()))
+        homepage = next(table for table in TABLES if table.key == "competitors").fields[2].name
+        assert competitor["fields"][homepage] == {
+            "link": "https://acme1.test",
+            "text": "Acme 1",
+        }
         competitor["fields"]["人工关注级别"] = "critical"
         # Same tier identity, updated amount: update existing row rather than create a duplicate.
         store.save_snapshot(snapshot(amount=12)); projection.resync()
@@ -148,7 +158,24 @@ def test_missing_base_resources_is_classified_without_network(tmp_path) -> None:
     with StateStore(tmp_path / "state.sqlite") as store:
         receipt = FeishuBaseProjection(FakeBase(), store).resync()
     assert not receipt.synced and "base-setup" in receipt.detail
+    assert receipt.outbox_pending == 1 and "retry queued" in receipt.detail
 
+
+def test_mapping_read_failure_queues_durable_resync_and_recovers(tmp_path) -> None:
+    api = FakeBase()
+    with StateStore(tmp_path / "state.sqlite") as store:
+        provision(store)
+        store.save_candidates([candidate()])
+        store.save_snapshot(snapshot())
+        api.fail_list_once = True
+        projection = FeishuBaseProjection(api, store)
+        failed = projection.resync()
+        assert not failed.synced and failed.outbox_pending == 1
+        assert "retry queued" in failed.detail
+        assert store.list_projection_outbox()[0]["operation"] == "base-resync"
+        recovered = projection.resync()
+        assert recovered.synced and recovered.outbox_pending == 0
+        assert len(api.records["tc"]) == 1
 
 def test_price_key_distinguishes_period_but_not_amount() -> None:
     monthly = PriceTier(name="Pro", amount=10, period="month", unit="seat")
@@ -235,3 +262,28 @@ def test_finished_runs_use_deterministic_tie_breaker(tmp_path) -> None:
         first, second = result("run-a"), result("run-b")
         store.finish_run(second); store.finish_run(first)
         assert [item.run_id for item in store.list_finished_run_results()] == ["run-a", "run-b"]
+
+def test_run_projection_preserves_legacy_aggregate_diagnostics(tmp_path) -> None:
+    api = FakeBase()
+    with StateStore(tmp_path / "state.sqlite") as store:
+        provision(store)
+        legacy = result("legacy-run").model_copy(update={
+            "errors": ["model_degraded: request failed"],
+        })
+        categorized = result("categorized-run").model_copy(update={
+            "projection_diagnostics": ["Base sync deferred"],
+            "errors": ["Base sync deferred"],
+        })
+        store.finish_run(legacy)
+        store.finish_run(categorized)
+        receipt = FeishuBaseProjection(api, store).resync()
+        assert receipt.synced
+
+        run_fields = next(table for table in TABLES if table.key == "runs").fields
+        run_id, failed_count = run_fields[0].name, run_fields[6].name
+        model_degraded = run_fields[7].name
+        rows = {row["fields"][run_id]: row["fields"] for row in api.records["tr"].values()}
+        assert rows["legacy-run"][failed_count] == 1
+        assert rows["legacy-run"][model_degraded] is True
+        assert rows["categorized-run"][failed_count] == 0
+        assert rows["categorized-run"][model_degraded] is False

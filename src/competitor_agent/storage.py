@@ -31,6 +31,25 @@ class StateStore:
             self.connection = None
             self._migration_checked = False
 
+    def open_readonly(self) -> None:
+        """Open an existing database without schema creation or migrations."""
+        if self.connection is not None:
+            return
+        if not self.db_path.is_file():
+            raise FileNotFoundError(self.db_path)
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        self.connection = sqlite3.connect(uri, uri=True)
+        self.connection.row_factory = sqlite3.Row
+        self._migration_checked = True
+
+    def has_table(self, name: str) -> bool:
+        if self.connection is None:
+            raise RuntimeError("StateStore is not open")
+        row = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
     def initialize(self) -> None:
         if self.connection is None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

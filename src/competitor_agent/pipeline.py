@@ -240,10 +240,33 @@ def _attach_projection(digest, receipt, projection: object | None):
     return digest.model_copy(update={"base_links": links, "projection": receipt})
 
 
-def _with_final_errors(digest, errors: list[str]):
-    """Keep digest summary and failed-source trace consistent with the final run."""
-    summary = re.sub(r"\u6765\u6e90\u5931\u8d25 \d+ \u4e2a", f"\u6765\u6e90\u5931\u8d25 {len(errors)} \u4e2a", digest.summary)
-    return digest.model_copy(update={"summary": summary, "failed_sources": list(errors)})
+def _with_final_errors(digest, source_failures: list[str]):
+    """Keep source-health text separate from model/Base/delivery diagnostics."""
+    summary = re.sub(
+        r"\u6765\u6e90\u5931\u8d25 \d+ \u4e2a",
+        f"\u6765\u6e90\u5931\u8d25 {len(source_failures)} \u4e2a",
+        digest.summary,
+    )
+    return digest.model_copy(update={
+        "summary": summary,
+        "failed_sources": list(source_failures),
+    })
+
+
+def _all_diagnostics(
+    source_failures: list[str],
+    model_diagnostics: list[str],
+    projection_diagnostics: list[str],
+    delivery_diagnostics: list[str],
+    operational_diagnostics: list[str],
+) -> list[str]:
+    return [
+        *source_failures,
+        *model_diagnostics,
+        *projection_diagnostics,
+        *delivery_diagnostics,
+        *operational_diagnostics,
+    ]
 
 
 def base_doctor(
@@ -253,13 +276,23 @@ def base_doctor(
     load_dotenv()
     config = load_config(config_path)
     client, owned = _owned_base_client(base_client)
-    store = StateStore(config.storage.database)
+    store: StateStore | None = None
+    database = Path(config.storage.database)
     try:
-        store.initialize()
+        # Doctor is observational: opening an existing SQLite file in mode=ro
+        # prevents schema creation, candidate migrations, and timestamp writes.
+        if database.is_file():
+            candidate_store = StateStore(database)
+            candidate_store.open_readonly()
+            if candidate_store.has_table("projection_resources"):
+                store = candidate_store
+            else:
+                candidate_store.close()
         result = FeishuBaseSetup(client, config, store).doctor()
         return {"ok": result.ok, "checks": result.checks, "detail": result.detail}
     finally:
-        store.close()
+        if store is not None:
+            store.close()
         _close_client(client, owned)
 
 
@@ -359,7 +392,11 @@ def run_pipeline(
 
         snapshots: list[ProductSnapshot] = []
         all_events: list[ChangeEvent] = []
-        errors: list[str] = [analyzer_diagnostic] if analyzer_diagnostic else []
+        source_failures: list[str] = []
+        model_diagnostics: list[str] = [analyzer_diagnostic] if analyzer_diagnostic else []
+        projection_diagnostics: list[str] = []
+        delivery_diagnostics: list[str] = []
+        operational_diagnostics: list[str] = []
         for candidate in candidates:
             if candidate.status.value != "monitored":
                 continue
@@ -371,12 +408,20 @@ def run_pipeline(
                 )
                 if not documents:
                     raise ValueError("no official source documents were collected")
+            except Exception as exc:
+                source_failures.append(f"{candidate.name}: {type(exc).__name__}: {exc}")
+                continue
+            try:
                 snapshot = analyzer.analyze(candidate, documents)
                 diagnostic = getattr(analyzer, "last_diagnostic", "")
                 if diagnostic:
-                    errors.append(f"{candidate.name}: {diagnostic}")
+                    model_diagnostics.append(f"{candidate.name}: {diagnostic}")
                 if not snapshot.evidence:
                     raise ValueError("no evidence-backed structured facts were extracted")
+            except Exception as exc:
+                model_diagnostics.append(f"{candidate.name}: {type(exc).__name__}: {exc}")
+                continue
+            try:
                 previous = store.get_latest_snapshot(candidate.id)
                 events = _diff_with_persistent_missing_counts(
                     store, previous, snapshot
@@ -388,8 +433,14 @@ def run_pipeline(
                 snapshots.append(snapshot)
                 all_events.extend(events)
             except Exception as exc:
-                errors.append(f"{candidate.name}: {type(exc).__name__}: {exc}")
+                operational_diagnostics.append(
+                    f"{candidate.name}: {type(exc).__name__}: {exc}"
+                )
 
+        errors = _all_diagnostics(
+            source_failures, model_diagnostics, projection_diagnostics,
+            delivery_diagnostics, operational_diagnostics,
+        )
         store.save_changes(run_id, all_events)
         confirmed_events = [event for event in all_events if event.confirmed]
         report_directory = (
@@ -401,7 +452,7 @@ def run_pipeline(
             candidates,
             snapshots,
             confirmed_events,
-            errors,
+            source_failures,
             report_path,
             first_run,
         )
@@ -420,7 +471,11 @@ def run_pipeline(
             started_at=started_at,
             finished_at=datetime.now(UTC),
             candidate_count=len(candidates), snapshot_count=len(snapshots),
-            change_count=len(confirmed_events), digest=digest, errors=errors,
+            change_count=len(confirmed_events), digest=digest,
+            source_failures=source_failures, model_diagnostics=model_diagnostics,
+            projection_diagnostics=projection_diagnostics,
+            delivery_diagnostics=delivery_diagnostics,
+            operational_diagnostics=operational_diagnostics, errors=errors,
         )
         # SQLite is written before optional remote projection or webhook delivery.
         store.finish_run(preliminary)
@@ -433,11 +488,18 @@ def run_pipeline(
             try:
                 projection_receipt = projection.sync(preliminary)
                 if not projection_receipt.synced:
-                    errors.append("Base sync deferred; retry queued.")
+                    retry_state = (
+                        "retry queued" if projection_receipt.outbox_pending else
+                        "will retry on the next scheduled run"
+                    )
+                    projection_diagnostics.append(f"Base sync deferred; {retry_state}.")
             except (FeishuBaseError, RuntimeError, OSError) as exc:
-                errors.append(f"Base sync deferred: {type(exc).__name__}.")
+                projection_diagnostics.append(
+                    f"Base sync deferred: {type(exc).__name__}; will retry on the next scheduled run."
+                )
                 projection_receipt = ProjectionReceipt(
-                    adapter="feishu-base", synced=False, detail="Base sync deferred; retry queued."
+                    adapter="feishu-base", synced=False,
+                    detail="Base sync deferred; will retry on the next scheduled run."
                 )
             digest = _attach_projection(digest, projection_receipt, projection)
 
@@ -449,9 +511,13 @@ def run_pipeline(
             selected_delivery = delivery_adapter if delivery_adapter is not None else ("mock" if fixture else None)
             receipt = _delivery(config, selected_delivery).publish(digest)
             if not receipt.delivered:
-                errors.append(f"Delivery: {receipt.detail}")
+                delivery_diagnostics.append(f"Delivery: {receipt.detail}")
 
-        digest = _with_final_errors(digest, errors)
+        errors = _all_diagnostics(
+            source_failures, model_diagnostics, projection_diagnostics,
+            delivery_diagnostics, operational_diagnostics,
+        )
+        digest = _with_final_errors(digest, source_failures)
         result = RunResult(
             run_id=run_id,
             status=RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
@@ -459,7 +525,11 @@ def run_pipeline(
             finished_at=datetime.now(UTC),
             candidate_count=len(candidates), snapshot_count=len(snapshots),
             change_count=len(confirmed_events), digest=digest, delivery=receipt,
-            projection=projection_receipt, errors=errors,
+            projection=projection_receipt, source_failures=source_failures,
+            model_diagnostics=model_diagnostics,
+            projection_diagnostics=projection_diagnostics,
+            delivery_diagnostics=delivery_diagnostics,
+            operational_diagnostics=operational_diagnostics, errors=errors,
         )
         store.finish_run(result)
         # One idempotent replay updates the current Base run row with the final
@@ -468,19 +538,37 @@ def run_pipeline(
             try:
                 final_receipt = projection.sync(result)
                 if not final_receipt.synced:
-                    errors.append("Base final run-log refresh deferred; retry queued.")
+                    retry_state = (
+                        "retry queued" if final_receipt.outbox_pending else
+                        "will retry on the next scheduled run"
+                    )
+                    projection_diagnostics.append(
+                        f"Base final run-log refresh deferred; {retry_state}."
+                    )
                 projection_receipt = final_receipt
             except (FeishuBaseError, RuntimeError, OSError) as exc:
-                errors.append(f"Base final run-log refresh deferred: {type(exc).__name__}.")
-                projection_receipt = ProjectionReceipt(
-                    adapter="feishu-base", synced=False, detail="Base final run-log refresh deferred."
+                projection_diagnostics.append(
+                    f"Base final run-log refresh deferred: {type(exc).__name__}; will retry on the next scheduled run."
                 )
+                projection_receipt = ProjectionReceipt(
+                    adapter="feishu-base", synced=False,
+                    detail="Base final run-log refresh deferred; will retry on the next scheduled run."
+                )
+            errors = _all_diagnostics(
+                source_failures, model_diagnostics, projection_diagnostics,
+                delivery_diagnostics, operational_diagnostics,
+            )
             digest = _attach_projection(digest, projection_receipt, projection)
-            digest = _with_final_errors(digest, errors)
+            digest = _with_final_errors(digest, source_failures)
             result = result.model_copy(update={
                 "status": RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
                 "digest": digest,
                 "projection": projection_receipt,
+                "source_failures": source_failures,
+                "model_diagnostics": model_diagnostics,
+                "projection_diagnostics": projection_diagnostics,
+                "delivery_diagnostics": delivery_diagnostics,
+                "operational_diagnostics": operational_diagnostics,
                 "errors": errors,
             })
             store.finish_run(result)

@@ -116,6 +116,8 @@ def test_collection_failure_preserves_last_successful_snapshot(
 
     assert baseline.snapshot_count == 2
     assert failed.status is RunStatus.PARTIAL
+    assert len(failed.source_failures) == 2
+    assert failed.model_diagnostics == []
     assert failed.snapshot_count == 0
     assert failed.change_count == 0
     with StateStore(tmp_path / "state.db") as store:
@@ -226,3 +228,40 @@ def test_fixture_pipeline_forces_offline_heuristic_analyzer(tmp_path: Path, monk
     assert result.snapshot_count == 2
     # Fixture mode deliberately ignores configured/parent model transports.
     assert calls == []
+
+def test_model_degradation_is_not_counted_as_source_failure(tmp_path: Path, monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from competitor_agent.analyzer import analyze_documents
+    from competitor_agent.models import Candidate, CandidateStatus, SourceDocument, SourceType
+
+    config_path = _config(tmp_path)
+    candidate = Candidate(
+        id="acme-test", name="Acme", homepage="https://acme.test",
+        category="saas", score=0.9, reasons=["match"],
+        status=CandidateStatus.MONITORED,
+    )
+    document = SourceDocument(
+        candidate_id=candidate.id, url="https://acme.test/pricing", title="Pricing",
+        fetched_at=datetime.now(UTC), content_hash="a" * 64, source_type=SourceType.HTML,
+        text="Pro plan $29 per month per seat.",
+    )
+
+    class DegradedAnalyzer:
+        last_diagnostic = ""
+
+        def analyze(self, selected, documents):
+            self.last_diagnostic = "model_degraded: request failed"
+            return analyze_documents(selected, documents)
+
+    monkeypatch.setattr("competitor_agent.pipeline.discover_candidates", lambda *_: [candidate])
+    monkeypatch.setattr("competitor_agent.pipeline.collect_candidate", lambda *_args, **_kwargs: [document])
+    monkeypatch.setattr("competitor_agent.pipeline.build_analyzer", lambda *_: DegradedAnalyzer())
+    result = run_pipeline(
+        config_path, fixture=False, delivery_adapter=MockDeliveryAdapter()
+    )
+
+    assert result.source_failures == []
+    assert len(result.model_diagnostics) == 1
+    assert result.status is RunStatus.PARTIAL
+    assert result.digest is not None
+    assert "\u6765\u6e90\u5931\u8d25 0 \u4e2a" in result.digest.summary

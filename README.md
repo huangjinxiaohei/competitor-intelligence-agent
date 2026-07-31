@@ -35,9 +35,11 @@ Copy-Item config/project.example.yaml config/project.yaml
 .\.venv\Scripts\python.exe -m competitor_agent.cli run --config config/project.yaml
 ```
 
-`base-doctor` 只读检查凭据和权限；`base-setup` 幂等创建并回填本地事实；`base-resync` 仅重放 SQLite 投影，不重新采集官网。
+`base-doctor` 不创建数据库、不迁移数据：已有 Base 时会验证 Bitable 读取能力；尚未执行 `base-setup` 时会将该能力标为“未验证”，而不是误报全绿。`base-setup` 幂等创建并回填本地事实；`base-resync` 仅重放 SQLite 投影，不重新采集官网。
 
 Base 包含四张表：竞品主表、套餐价格表、变化事件表、运行日志表；并创建竞品总览、竞品卡片、低置信度、价格对比、本周变化、高优先级变化、指标总览、采集异常、运行历史 9 个视图。投影是单向的：Agent 只写机器字段，保留人工关注级别、标签和备注。
+
+飞书当前公开的创建视图接口只接受视图名称和类型，不接受保存筛选、分组、排序或可见列。`base-setup` 会在 manifest 的 `manual_configuration_warnings` 中写入每个视图的准确收尾方法，并在命令回执明确提示。首次建库后按提示在 Base 界面完成一次设置即可，例如：`价格对比` 按“币种 → 关联竞品”分组，`低置信度` 筛选置信度 `< 0.70`，`本周变化` 筛选本周检测时间，`采集异常` 筛选 partial/failed 或失败数大于 0。
 
 每轮都先落本地快照和报告，再同步 Base。Base 失败会使运行标为 partial 并写入重试 outbox；已确认的变化仍会带官方证据提醒，不会带过期 Base 链接。
 

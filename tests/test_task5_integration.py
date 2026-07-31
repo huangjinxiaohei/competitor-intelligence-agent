@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from competitor_agent.cli import app
 from competitor_agent.delivery import MockDeliveryAdapter, render_payload
 from competitor_agent.models import Digest, DigestProduct, ProjectionReceipt, RunStatus
-from competitor_agent.pipeline import run_pipeline
+from competitor_agent.pipeline import base_doctor, run_pipeline
 from competitor_agent.storage import StateStore
 
 
@@ -90,12 +90,17 @@ def test_failed_first_projection_marks_run_partial_keeps_evidence_notification_w
     run_pipeline(config, fixture=True, projection_adapter=FakeProjection(), delivery_adapter=delivery)
     failed = run_pipeline(config, fixture=True, projection_adapter=FakeProjection([False]), delivery_adapter=delivery)
     assert failed.status is RunStatus.PARTIAL
+    assert failed.source_failures == []
+    assert failed.projection_diagnostics
     assert failed.delivery is not None and failed.delivery.delivered
     assert failed.digest is not None and failed.digest.base_links == {}
     text = str(render_payload(failed.digest))
     assert "base.test/overview" not in text
     assert "Base\u540c\u6b65\u5f85\u91cd\u8bd5" in text
-    assert "\u6765\u6e901" in text
+    assert "\u6765\u6e90\u5931\u8d25 0 \u4e2a" in failed.digest.summary
+    markdown = Path(failed.digest.report_path).read_text(encoding="utf-8")
+    assert "## 运行诊断" in markdown
+    assert "## 采集失败" not in markdown
     with StateStore(tmp_path / "state.db") as store:
         assert store.list_finished_run_results()[-1].status is RunStatus.PARTIAL
 
@@ -106,12 +111,14 @@ def test_final_projection_failure_clears_digest_links_and_preserves_evidence(tmp
     assert projection.calls == 2
     assert projection.runs[1] is not None and projection.runs[1].delivery is not None
     assert result.status is RunStatus.PARTIAL
+    assert result.source_failures == []
+    assert result.projection_diagnostics
     assert result.projection is not None and not result.projection.synced
     assert result.digest is not None and result.digest.projection == result.projection
     assert result.digest.base_links == {}
     text = str(render_payload(result.digest))
     assert "base.test/overview" not in text
-    assert "\u6765\u6e901" in text
+    assert "\u6765\u6e90\u5931\u8d25 0 \u4e2a" in result.digest.summary
     assert "Base\u540c\u6b65\u5f85\u91cd\u8bd5" in text
     payload = _report(result)
     assert payload["run_result"]["status"] == "partial"
@@ -124,6 +131,45 @@ def test_card_renders_base_overview_changes_prices_and_product_record_links() ->
     for label in ("\u7ade\u54c1\u603b\u89c8", "\u672c\u5468\u53d8\u5316", "\u4ef7\u683c\u5bf9\u6bd4", "Base\u8bb0\u5f55"):
         assert label in text
 
+
+class DoctorClient:
+    app_id = "app-id"
+    app_secret = "app-secret"
+
+    def __init__(self) -> None:
+        self.listed: list[str] = []
+
+    def tenant_token(self) -> str:
+        return "token"
+
+    def list_tables(self, app_token: str) -> list[dict]:
+        self.listed.append(app_token)
+        return []
+
+
+def test_base_doctor_is_readonly_and_qualifies_unverified_capabilities(tmp_path: Path) -> None:
+    config = config_path(tmp_path)
+    database = tmp_path / "state.db"
+    result = base_doctor(config, base_client=DoctorClient())
+    assert not result["ok"]
+    assert result["checks"]["authentication"] == "ok"
+    assert "unverified" in result["checks"]["bitable_read"]
+    assert not database.exists()
+
+
+def test_base_doctor_reads_existing_projection_without_mutating_sqlite(tmp_path: Path) -> None:
+    config = config_path(tmp_path)
+    database = tmp_path / "state.db"
+    with StateStore(database) as store:
+        store.set_projection_resource("base", "app-existing")
+    before = database.read_bytes()
+    api = DoctorClient()
+    result = base_doctor(config, base_client=api)
+    assert not result["ok"] and result["checks"]["bitable_read"] == "ok"
+    assert "unverified" in result["checks"]["bitable_write"]
+    assert "unverified" in result["checks"]["collaborator_manage"]
+    assert api.listed == ["app-existing"]
+    assert database.read_bytes() == before
 
 def test_base_cli_commands_forward_config(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()

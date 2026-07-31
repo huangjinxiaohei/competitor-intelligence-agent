@@ -92,7 +92,8 @@ class FeishuBaseProjection:
     def sync(self, run: RunResult | None = None) -> ProjectionReceipt:
         resources = self._resources()
         if resources is None:
-            return self._receipt(False, 0, "Base schema resources are missing; run base-setup first.")
+            self._queue_resync_retry("missing Base schema resources")
+            return self._receipt(False, 0, "Base schema resources are missing; run base-setup first; retry queued.")
         app_token, tables = resources
         if not self._drain_outbox(app_token, tables):
             return self._receipt(False, 0, "Base projection deferred while older batches retry.")
@@ -107,8 +108,11 @@ class FeishuBaseProjection:
             current_state = "deferred" if self.store.list_projection_outbox() else "synced"
             count += self._sync_runs(app_token, tables["runs"], run, current_state)
         except FeishuBaseError as exc:
-            synced = False
-            return self._receipt(False, count, f"Base projection deferred: {exc.operation}.")
+            # Mapping recovery and remote reads fail before a write batch exists.
+            # Queue a durable idempotent resync marker so the receipt and next
+            # scheduled run agree about retry state.
+            self._queue_resync_retry(exc.operation)
+            return self._receipt(False, count, f"Base projection deferred: {exc.operation}; retry queued.")
         completed = not self.store.list_projection_outbox()
         return self._receipt(completed, count,
                              "Base projection synchronized." if completed else "Base projection has deferred batches.")
@@ -164,7 +168,12 @@ class FeishuBaseProjection:
         fields: dict[str, Any] = {
             _field("competitors", "name"): candidate.name,
             _field("competitors", "id"): candidate.id,
-            _field("competitors", "homepage"): candidate.homepage,
+            # Feishu URL fields require the structured link/text object. A plain
+            # string is rejected by the live API with URLFieldConvFail.
+            _field("competitors", "homepage"): {
+                "link": candidate.homepage,
+                "text": candidate.name or candidate.homepage,
+            },
             _field("competitors", "status"): candidate.status.value,
             _field("competitors", "score"): candidate.score,
         }
@@ -259,6 +268,24 @@ class FeishuBaseProjection:
         records: list[tuple[str, dict[str, Any]]] = []
         for result in finished:
             duration = max(0.0, (result.finished_at - result.started_at).total_seconds())
+            categorized = any((
+                result.source_failures, result.model_diagnostics,
+                result.projection_diagnostics, result.delivery_diagnostics,
+                result.operational_diagnostics,
+            ))
+            # Old RunResult JSON only had the aggregate errors array. Preserve
+            # its historical signal during Base backfill instead of projecting
+            # a false zero after category fields were added with defaults.
+            failure_count = (
+                len(result.source_failures) if categorized else len(result.errors)
+            )
+            model_degraded = (
+                bool(result.model_diagnostics) if categorized else
+                any(
+                    "model" in error.casefold() or "degrad" in error.casefold()
+                    for error in result.errors
+                )
+            )
             records.append((result.run_id, {
                 _field("runs", "id"): result.run_id,
                 _field("runs", "status"): result.status.value,
@@ -266,8 +293,8 @@ class FeishuBaseProjection:
                 _field("runs", "candidates"): result.candidate_count,
                 _field("runs", "snapshots"): result.snapshot_count,
                 _field("runs", "changes"): result.change_count,
-                _field("runs", "failed"): len(result.errors),
-                _field("runs", "model_degraded"): any("model" in error.casefold() or "degrad" in error.casefold() for error in result.errors),
+                _field("runs", "failed"): failure_count,
+                _field("runs", "model_degraded"): model_degraded,
                 _field("runs", "base_sync"): self._run_projection_state(result, current_run, current_state),
                 _field("runs", "message_status"): "sent" if result.delivery and result.delivery.delivered else "not_sent",
                 _field("runs", "report_path"): result.digest.report_path if result.digest else "",
@@ -391,10 +418,22 @@ class FeishuBaseProjection:
             mappings.update(self._recover_mappings(app, table_key, table, missing))
         return [item for item in records if str(item["business_key"]) not in mappings]
 
+    def _queue_resync_retry(self, reason: str) -> None:
+        if any(item.get("operation") == "base-resync" for item in self.store.list_projection_outbox()):
+            return
+        outbox_id = self.store.enqueue_projection_outbox(
+            "base-resync", {"kind": "resync", "reason": reason}
+        )
+        self.store.mark_projection_outbox_attempt(outbox_id, reason)
     def _drain_outbox(self, app: str, tables: dict[str, str]) -> bool:
         all_ok = True
         for item in self.store.list_projection_outbox():
             try:
+                if item.get("operation") == "base-resync":
+                    # The current sync call is the replay. Retire the marker,
+                    # then rebuild from SQLite using the normal code path.
+                    self.store.complete_projection_outbox(int(item["id"]))
+                    continue
                 payload = json.loads(str(item["payload"]))
                 if not isinstance(payload, dict) or payload.get("table_key") not in tables:
                     raise FeishuBaseError("Projection outbox payload is invalid.", operation="projection outbox")

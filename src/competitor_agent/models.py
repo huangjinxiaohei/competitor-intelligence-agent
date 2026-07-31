@@ -178,5 +178,11 @@ class RunResult(StrictModel):
     digest: Digest | None = None
     delivery: DeliveryReceipt | None = None
     projection: ProjectionReceipt | None = None
+    # Categorized diagnostics keep source health distinct from optional adapters.
+    source_failures: list[str] = Field(default_factory=list)
+    model_diagnostics: list[str] = Field(default_factory=list)
+    projection_diagnostics: list[str] = Field(default_factory=list)
+    delivery_diagnostics: list[str] = Field(default_factory=list)
+    operational_diagnostics: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 

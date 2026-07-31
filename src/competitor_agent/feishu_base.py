@@ -25,6 +25,7 @@ _AUTH_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
 _API_ORIGIN = "https://open.feishu.cn"
 _TOKEN_REFRESH_SECONDS = 60
 _MAX_RETRIES = 3
+_TRANSIENT_API_CODES = frozenset({1254290, 1254291, 1254607})
 
 
 class FeishuBaseError(RuntimeError):
@@ -134,6 +135,22 @@ VIEWS: tuple[tuple[str, str, str], ...] = (
 
 
 
+# The public create/update-view contracts currently expose name and view type,
+# but not saved filters, groups, sorts, or visible-column layouts. Each created
+# view is therefore marked with an exact UI finishing recipe.
+_VIEW_MANUAL_CONFIGURATION: dict[str, str] = {
+    "竞品总览": "按最后采集时间倒序；展示名称、官网、状态、评分、摘要、置信度。",
+    "竞品卡片": "卡片标题使用名称；展示摘要、功能、配置、可用性和置信度。",
+    "低置信度": "筛选置信度低于 0.70；按置信度升序。",
+    "价格对比": "先按币种、再按关联竞品分组；展示套餐、金额、周期、单位和限定条件。",
+    "本周变化": "筛选检测时间为本周；按检测时间倒序。",
+    "高优先级变化": "筛选重要度为 high；按检测时间倒序。",
+    "指标总览": "筛选是否最新为真；展示状态、候选、快照、变化、失败数和耗时。",
+    "采集异常": "筛选状态为 partial/failed 或失败数大于 0；按开始时间倒序。",
+    "运行历史": "按开始时间倒序；展示同步与消息状态。",
+}
+
+
 class FeishuBaseClient:
     """Small synchronous client covering setup and future projection writes."""
 
@@ -236,7 +253,7 @@ class FeishuBaseClient:
                     f"Feishu {action} failed while contacting the API.",
                     operation=action,
                 ) from exc
-            if response.status_code == 429 or response.status_code >= 500:
+            if self._is_transient_response(response):
                 if attempt < self._max_retries:
                     retry_after = response.headers.get("Retry-After")
                     try:
@@ -247,6 +264,16 @@ class FeishuBaseClient:
                     continue
             return response
         raise FeishuBaseError(f"Feishu {action} retry budget exhausted.", operation=action)
+
+    @staticmethod
+    def _is_transient_response(response: httpx.Response) -> bool:
+        if response.status_code == 429 or response.status_code >= 500:
+            return True
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and payload.get("code") in _TRANSIENT_API_CODES
 
     def request(
         self,
@@ -404,16 +431,30 @@ class FeishuBaseSetup:
             checks["authentication"] = "failed; check application credentials and Base scopes"
             return BaseDoctorResult(ok=False, checks=checks, detail="Authentication capability check failed.")
         checks["authentication"] = "ok"
-        if self.store is not None:
-            app_token = self.store.get_projection_resource("base")
-            if app_token:
-                try:
-                    self.client.list_tables(app_token)
-                except FeishuBaseError:
-                    checks["bitable_read"] = "failed; check bitable read scope and document access"
-                    return BaseDoctorResult(ok=False, checks=checks, detail="Bitable read capability check failed.")
-                checks["bitable_read"] = "ok"
-        return BaseDoctorResult(ok=True, checks=checks, detail="Token capability check succeeded.")
+        app_token = self.store.get_projection_resource("base") if self.store is not None else None
+        if not app_token:
+            checks["bitable_read"] = "unverified; run base-setup first"
+            return BaseDoctorResult(
+                ok=False,
+                checks=checks,
+                detail="Authentication succeeded, but Bitable read capability is unverified until a Base exists.",
+            )
+        try:
+            self.client.list_tables(app_token)
+        except FeishuBaseError:
+            checks["bitable_read"] = "failed; check bitable read scope and document access"
+            return BaseDoctorResult(ok=False, checks=checks, detail="Bitable read capability check failed.")
+        checks["bitable_read"] = "ok"
+        checks["bitable_write"] = "unverified; base-doctor is read-only"
+        checks["collaborator_manage"] = "unverified; base-doctor is read-only"
+        return BaseDoctorResult(
+            ok=False,
+            checks=checks,
+            detail=(
+                "Authentication and Bitable read checks succeeded; write and "
+                "collaborator-management capabilities remain unverified until base-setup."
+            ),
+        )
 
     def setup(self) -> ProjectionReceipt:
         if self.config is None or self.store is None or self.config.feishu_base is None:
@@ -431,7 +472,13 @@ class FeishuBaseSetup:
         view_links = self._ensure_views(app_token, table_ids, base_url)
         self._ensure_permissions(app_token)
         self._write_manifest(app_token, base_url, table_ids, view_links)
-        return ProjectionReceipt(adapter="feishu-base", synced=True, base_url=base_url, resource_links=view_links, detail="Base schema is ready.")
+        return ProjectionReceipt(
+            adapter="feishu-base",
+            synced=True,
+            base_url=base_url,
+            resource_links=view_links,
+            detail="Base schema is ready; all saved-view filters, grouping, sorting, and visible fields require manual configuration.",
+        )
 
     def _ensure_base(self, name: str) -> tuple[str, str, list[dict[str, Any]]]:
         """Validate persisted resources; only explicit Base-not-found may use manifest fallback."""
@@ -625,6 +672,11 @@ class FeishuBaseSetup:
                 raise FeishuBaseError(f"Feishu did not return an ID for view {name}.")
             link = f"{base_url}?table={table_id}&view={view_id}"
             self.store.set_projection_resource(f"view:{table_key}:{name}", view_id, link)
+            self.store.set_projection_resource(
+                f"view-warning:{table_key}:{name}",
+                "manual-configuration-required",
+                _VIEW_MANUAL_CONFIGURATION[name],
+            )
             links[name] = link
         return links
 
@@ -656,6 +708,9 @@ class FeishuBaseSetup:
             "base": {"id": app_token, "url": base_url},
             "tables": table_ids,
             "views": {name: {"id": view_ids.get(name), "url": url} for name, url in view_links.items()},
+            "manual_configuration_warnings": {
+                name: _VIEW_MANUAL_CONFIGURATION[name] for name in view_links
+            },
         }
         temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

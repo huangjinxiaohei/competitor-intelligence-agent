@@ -110,7 +110,7 @@ def _request(url: str, config: ProjectConfig) -> httpx.Response:
     raise error
 
 
-def _browser_text(url: str) -> tuple[str, str] | None:
+def _browser_text(url: str) -> tuple[str, str, str] | None:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -120,9 +120,10 @@ def _browser_text(url: str) -> tuple[str, str] | None:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url, wait_until="networkidle")
+            final_url = canonicalize_url(page.url)
             title, text = page.title(), page.locator("body").inner_text()
             browser.close()
-            return title, _normalise_text(text)
+            return final_url, title, _normalise_text(text)
     except Exception:
         return None
 
@@ -178,7 +179,9 @@ def _collect_one(candidate: Candidate, url: str, config: ProjectConfig, fixture_
     if config.collection.browser_fallback and len(text) < 40 and "<script" in response.text.lower():
         rendered = _browser_text(final_url)
         if rendered is not None:
-            title, text = rendered
+            rendered_url, rendered_title, rendered_text = rendered
+            if _same_official_site(rendered_url, candidate):
+                final_url, title, text = rendered_url, rendered_title, rendered_text
     return _CollectedPage(_source_document(candidate, final_url, title, text, SourceType.HTML), response.text)
 
 

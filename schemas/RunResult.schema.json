@@ -463,6 +463,41 @@
       ],
       "default": null
     },
+    "source_failures": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Source Failures",
+      "type": "array"
+    },
+    "model_diagnostics": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Model Diagnostics",
+      "type": "array"
+    },
+    "projection_diagnostics": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Projection Diagnostics",
+      "type": "array"
+    },
+    "delivery_diagnostics": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Delivery Diagnostics",
+      "type": "array"
+    },
+    "operational_diagnostics": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Operational Diagnostics",
+      "type": "array"
+    },
     "errors": {
       "items": {
         "type": "string"

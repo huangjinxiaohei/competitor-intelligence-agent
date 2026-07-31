@@ -84,6 +84,34 @@ def test_collect_candidate_handles_text_pdf_size_limit_and_browser_fallback(monk
     html_request = collector.httpx.Request("GET", "https://acme.test")
     shell = collector.httpx.Response(200, text="<html><script>render()</script></html>", request=html_request)
     monkeypatch.setattr(collector, "_request", lambda *_: shell)
-    monkeypatch.setattr(collector, "_browser_text", lambda _: ("Rendered", "Rendered product body"))
+    monkeypatch.setattr(
+        collector,
+        "_browser_text",
+        lambda _: ("https://acme.test/rendered", "Rendered", "Rendered product body"),
+    )
     rendered = collect_candidate(candidate("https://acme.test"), config())
     assert (rendered[0].title, rendered[0].text) == ("Rendered", "Rendered product body")
+    assert rendered[0].url == "https://acme.test/rendered"
+
+
+def test_browser_fallback_discards_rendered_content_after_off_domain_navigation(monkeypatch) -> None:
+    from competitor_agent import collector
+
+    html_request = collector.httpx.Request("GET", "https://acme.test")
+    shell = collector.httpx.Response(
+        200,
+        text="<html><script>window.location = 'https://evil.test/landing'</script></html>",
+        request=html_request,
+    )
+    monkeypatch.setattr(collector, "_request", lambda *_: shell)
+    monkeypatch.setattr(
+        collector,
+        "_browser_text",
+        lambda _: ("https://evil.test/landing", "External", "Off-domain rendered body"),
+    )
+
+    documents = collect_candidate(candidate("https://acme.test"), config())
+
+    assert len(documents) == 1
+    assert documents[0].url == "https://acme.test/"
+    assert (documents[0].title, documents[0].text) == ("Acme", "")

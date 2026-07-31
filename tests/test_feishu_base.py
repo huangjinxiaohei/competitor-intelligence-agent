@@ -12,6 +12,7 @@ from competitor_agent.feishu_base import (
     FeishuBaseError,
     FeishuBaseSetup,
     TABLES,
+    VIEWS,
 )
 from competitor_agent.storage import StateStore
 
@@ -136,6 +137,47 @@ def test_request_retries_rate_limit_and_redacts_failures() -> None:
     assert "private.example" not in str(caught.value)
 
 
+
+def test_http_200_transient_application_codes_retry_then_raise_sanitized_error() -> None:
+    table_calls = 0
+    waits: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal table_calls
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        table_calls += 1
+        if table_calls == 1:
+            return httpx.Response(200, json={"code": 1254290, "msg": "rate limited"})
+        return response({"items": [], "has_more": False})
+
+    assert client(handler, sleep=waits.append).list_tables("app") == []
+    assert table_calls == 2
+    assert waits == [1.0]
+
+    exhausted_calls = 0
+
+    def exhausted(request: httpx.Request) -> httpx.Response:
+        nonlocal exhausted_calls
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        exhausted_calls += 1
+        return httpx.Response(200, json={"code": 1254291, "msg": "write conflict"})
+
+    service = FeishuBaseClient(
+        app_id="app-id",
+        app_secret="app-secret",
+        client=httpx.Client(transport=httpx.MockTransport(exhausted), base_url=API),
+        max_retries=1,
+        sleep=lambda _: None,
+    )
+    with pytest.raises(FeishuBaseError) as caught:
+        service.list_tables("app")
+    assert exhausted_calls == 2
+    assert caught.value.http_status == 200
+    assert caught.value.api_code == 1254291
+    assert "write conflict" not in str(caught.value)
+
 def test_paginated_lists_and_record_helpers() -> None:
     pages = []
 
@@ -167,6 +209,20 @@ def test_doctor_reports_missing_env_without_network(monkeypatch: pytest.MonkeyPa
     assert not result.ok
     assert result.checks["credentials"] == "missing FEISHU_APP_ID, FEISHU_APP_SECRET"
 
+
+
+def test_doctor_marks_bitable_read_unverified_before_base_exists(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("tenant_access_token/internal")
+        return token_response()
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    result = FeishuBaseSetup(client(handler), config(tmp_path), store).doctor()
+    assert not result.ok
+    assert result.checks["authentication"] == "ok"
+    assert result.checks["bitable_read"] == "unverified; run base-setup first"
+    store.close()
 
 def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_path: Path) -> None:
     created: list[tuple[str, str, dict]] = []
@@ -227,6 +283,7 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
     setup = FeishuBaseSetup(client(handler), config(tmp_path), store, owner_email="owner@example.com", viewer_chat_id="oc_chat")
     receipt = setup.setup()
     assert receipt.synced
+    assert "manual configuration" in receipt.detail
     assert receipt.base_url == "https://feishu.cn/base/app-test"
     assert set(receipt.resource_links) >= {"竞品总览", "本周变化"}
     assert len(tables) == 4
@@ -250,7 +307,11 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
         {"member_type": "email", "member_id": "owner@example.com", "perm": "edit", "type": "user"},
         {"member_type": "openchat", "member_id": "oc_chat", "perm": "view", "type": "chat"},
     ]
-    assert (tmp_path / "manifest.json").read_text(encoding="utf-8").startswith("{")
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["manual_configuration_warnings"]) == len(VIEWS)
+    assert "币种" in manifest["manual_configuration_warnings"]["价格对比"]
+    assert "本周" in manifest["manual_configuration_warnings"]["本周变化"]
+    assert store.get_projection_resource(f"view-warning:{VIEWS[0][0]}:{VIEWS[0][1]}") == "manual-configuration-required"
     assert store.get_projection_resource("base") == "app-test"
     field_count = sum(len(rows) for rows in fields.values())
     view_count = sum(len(rows) for rows in views.values())

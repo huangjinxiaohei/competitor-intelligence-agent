@@ -133,8 +133,18 @@ def _markdown(
         f"- {item.name} (`{item.id}`) - {item.homepage} - {item.score:.2f}"
         for item in candidates
     )
-    if errors:
-        lines.extend(["", "## \u91c7\u96c6\u5931\u8d25", ""] + [f"- {error}" for error in errors])
+    if digest.failed_sources:
+        lines.extend(
+            ["", "## \u91c7\u96c6\u5931\u8d25", ""]
+            + [f"- {error}" for error in digest.failed_sources]
+        )
+    source_set = set(digest.failed_sources)
+    diagnostics = [error for error in errors if error not in source_set]
+    if diagnostics:
+        lines.extend(
+            ["", "## \u8fd0\u884c\u8bca\u65ad", ""]
+            + [f"- {error}" for error in diagnostics]
+        )
     if run_result is not None:
         projection = run_result.projection
         delivery = run_result.delivery

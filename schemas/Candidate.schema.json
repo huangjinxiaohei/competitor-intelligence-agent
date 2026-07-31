@@ -46,6 +46,13 @@
     },
     "status": {
       "$ref": "#/$defs/CandidateStatus"
+    },
+    "official_entry_urls": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Official Entry Urls",
+      "type": "array"
     }
   },
   "required": [

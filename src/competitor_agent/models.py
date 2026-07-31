@@ -66,6 +66,7 @@ class Candidate(StrictModel):
     score: float = Field(ge=0, le=1)
     reasons: list[str] = Field(min_length=1)
     status: CandidateStatus
+    official_entry_urls: list[str] = Field(default_factory=list)
 
     @field_validator("homepage")
     @classmethod
@@ -96,6 +97,7 @@ class ProductSnapshot(StrictModel):
     availability: str | None = None
     confidence: float = Field(ge=0, le=1)
     evidence: list[Evidence] = Field(default_factory=list)
+    field_evidence: dict[str, list[Evidence]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_evidence_for_facts(self) -> ProductSnapshot:
@@ -135,6 +137,16 @@ class DigestProduct(StrictModel):
     evidence_urls: list[str] = Field(default_factory=list, max_length=2)
 
 
+class ProjectionReceipt(StrictModel):
+    adapter: str
+    synced: bool
+    base_url: str | None = None
+    resource_links: dict[str, str] = Field(default_factory=dict)
+    records_synced: int = Field(default=0, ge=0)
+    outbox_pending: int = Field(default=0, ge=0)
+    detail: str = ""
+
+
 class Digest(StrictModel):
     run_id: str
     kind: str
@@ -144,6 +156,8 @@ class Digest(StrictModel):
     products: list[DigestProduct] = Field(default_factory=list, max_length=5)
     failed_sources: list[str] = Field(default_factory=list)
     report_path: str
+    base_links: dict[str, str] = Field(default_factory=dict)
+    projection: ProjectionReceipt | None = None
 
 
 class DeliveryReceipt(StrictModel):
@@ -163,5 +177,6 @@ class RunResult(StrictModel):
     change_count: int = 0
     digest: Digest | None = None
     delivery: DeliveryReceipt | None = None
+    projection: ProjectionReceipt | None = None
     errors: list[str] = Field(default_factory=list)
 

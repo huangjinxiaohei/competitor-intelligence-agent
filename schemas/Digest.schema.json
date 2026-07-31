@@ -220,6 +220,61 @@
       ],
       "title": "PriceTier",
       "type": "object"
+    },
+    "ProjectionReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "title": "Adapter",
+          "type": "string"
+        },
+        "synced": {
+          "title": "Synced",
+          "type": "boolean"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "resource_links": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Resource Links",
+          "type": "object"
+        },
+        "records_synced": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Records Synced",
+          "type": "integer"
+        },
+        "outbox_pending": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Outbox Pending",
+          "type": "integer"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "synced"
+      ],
+      "title": "ProjectionReceipt",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -265,6 +320,24 @@
     "report_path": {
       "title": "Report Path",
       "type": "string"
+    },
+    "base_links": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Base Links",
+      "type": "object"
+    },
+    "projection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectionReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

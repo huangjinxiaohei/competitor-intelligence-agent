@@ -49,6 +49,15 @@ class CollectionSettings(ConfigModel):
     per_domain_delay_seconds: float = Field(default=1.0, ge=0)
     max_pdf_megabytes: int = Field(default=20, ge=1)
     browser_fallback: bool = True
+    max_pages_per_candidate: int = Field(default=8, ge=1, le=100)
+
+
+class FeishuBaseSettings(ConfigModel):
+    app_token: str = Field(min_length=1)
+    competitors_table: str = Field(min_length=1)
+    snapshots_table: str = Field(min_length=1)
+    changes_table: str = Field(min_length=1)
+    runs_table: str = Field(min_length=1)
 
 
 class ScheduleSettings(ConfigModel):
@@ -60,6 +69,7 @@ class AdapterSettings(ConfigModel):
     search: str = "host"
     analyzer: str = "heuristic"
     delivery: str = "mock"
+    projection: str = "mock"
 
 
 class StorageSettings(ConfigModel):
@@ -74,6 +84,7 @@ class ProjectConfig(ConfigModel):
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     adapters: AdapterSettings = Field(default_factory=AdapterSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    feishu_base: FeishuBaseSettings | None = None
 
 
 def load_config(path: str | Path) -> ProjectConfig:

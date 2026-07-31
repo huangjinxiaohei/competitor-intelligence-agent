@@ -119,6 +119,14 @@
           "title": "Changes",
           "type": "array"
         },
+        "products": {
+          "items": {
+            "$ref": "#/$defs/DigestProduct"
+          },
+          "maxItems": 5,
+          "title": "Products",
+          "type": "array"
+        },
         "failed_sources": {
           "items": {
             "type": "string"
@@ -129,6 +137,24 @@
         "report_path": {
           "title": "Report Path",
           "type": "string"
+        },
+        "base_links": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Base Links",
+          "type": "object"
+        },
+        "projection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectionReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -139,6 +165,72 @@
         "report_path"
       ],
       "title": "Digest",
+      "type": "object"
+    },
+    "DigestProduct": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "homepage": {
+          "title": "Homepage",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 5,
+          "title": "Features",
+          "type": "array"
+        },
+        "pricing": {
+          "items": {
+            "$ref": "#/$defs/PriceTier"
+          },
+          "maxItems": 3,
+          "title": "Pricing",
+          "type": "array"
+        },
+        "configurations": {
+          "additionalProperties": true,
+          "maxProperties": 3,
+          "title": "Configurations",
+          "type": "object"
+        },
+        "confidence": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "evidence_urls": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 2,
+          "title": "Evidence Urls",
+          "type": "array"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "name",
+        "homepage"
+      ],
+      "title": "DigestProduct",
       "type": "object"
     },
     "Evidence": {
@@ -166,6 +258,132 @@
         "observed_at"
       ],
       "title": "Evidence",
+      "type": "object"
+    },
+    "PriceTier": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "amount": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Amount"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "period": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Period"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "qualifiers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Qualifiers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "PriceTier",
+      "type": "object"
+    },
+    "ProjectionReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "title": "Adapter",
+          "type": "string"
+        },
+        "synced": {
+          "title": "Synced",
+          "type": "boolean"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "resource_links": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Resource Links",
+          "type": "object"
+        },
+        "records_synced": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Records Synced",
+          "type": "integer"
+        },
+        "outbox_pending": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Outbox Pending",
+          "type": "integer"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "synced"
+      ],
+      "title": "ProjectionReceipt",
       "type": "object"
     },
     "RunStatus": {
@@ -227,6 +445,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/DeliveryReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "projection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProjectionReceipt"
         },
         {
           "type": "null"

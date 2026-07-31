@@ -162,6 +162,16 @@
       },
       "title": "Evidence",
       "type": "array"
+    },
+    "field_evidence": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/Evidence"
+        },
+        "type": "array"
+      },
+      "title": "Field Evidence",
+      "type": "object"
     }
   },
   "required": [

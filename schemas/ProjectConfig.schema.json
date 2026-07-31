@@ -17,6 +17,11 @@
           "default": "mock",
           "title": "Delivery",
           "type": "string"
+        },
+        "projection": {
+          "default": "mock",
+          "title": "Projection",
+          "type": "string"
         }
       },
       "title": "AdapterSettings",
@@ -53,6 +58,13 @@
           "default": true,
           "title": "Browser Fallback",
           "type": "boolean"
+        },
+        "max_pages_per_candidate": {
+          "default": 8,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Pages Per Candidate",
+          "type": "integer"
         }
       },
       "title": "CollectionSettings",
@@ -96,6 +108,45 @@
         }
       },
       "title": "DiscoverySettings",
+      "type": "object"
+    },
+    "FeishuBaseSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "app_token": {
+          "minLength": 1,
+          "title": "App Token",
+          "type": "string"
+        },
+        "competitors_table": {
+          "minLength": 1,
+          "title": "Competitors Table",
+          "type": "string"
+        },
+        "snapshots_table": {
+          "minLength": 1,
+          "title": "Snapshots Table",
+          "type": "string"
+        },
+        "changes_table": {
+          "minLength": 1,
+          "title": "Changes Table",
+          "type": "string"
+        },
+        "runs_table": {
+          "minLength": 1,
+          "title": "Runs Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "app_token",
+        "competitors_table",
+        "snapshots_table",
+        "changes_table",
+        "runs_table"
+      ],
+      "title": "FeishuBaseSettings",
       "type": "object"
     },
     "ProjectSettings": {
@@ -193,6 +244,17 @@
     },
     "storage": {
       "$ref": "#/$defs/StorageSettings"
+    },
+    "feishu_base": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FeishuBaseSettings"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

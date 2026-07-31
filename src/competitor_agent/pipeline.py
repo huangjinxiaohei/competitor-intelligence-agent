@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -239,6 +240,12 @@ def _attach_projection(digest, receipt, projection: object | None):
     return digest.model_copy(update={"base_links": links, "projection": receipt})
 
 
+def _with_final_errors(digest, errors: list[str]):
+    """Keep digest summary and failed-source trace consistent with the final run."""
+    summary = re.sub(r"\u6765\u6e90\u5931\u8d25 \d+ \u4e2a", f"\u6765\u6e90\u5931\u8d25 {len(errors)} \u4e2a", digest.summary)
+    return digest.model_copy(update={"summary": summary, "failed_sources": list(errors)})
+
+
 def base_doctor(
     config_path: str | Path = "config/project.yaml", *, base_client: object | None = None,
 ) -> dict[str, object]:
@@ -444,6 +451,7 @@ def run_pipeline(
             if not receipt.delivered:
                 errors.append(f"Delivery: {receipt.detail}")
 
+        digest = _with_final_errors(digest, errors)
         result = RunResult(
             run_id=run_id,
             status=RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
@@ -467,12 +475,18 @@ def run_pipeline(
                 projection_receipt = ProjectionReceipt(
                     adapter="feishu-base", synced=False, detail="Base final run-log refresh deferred."
                 )
+            digest = _attach_projection(digest, projection_receipt, projection)
+            digest = _with_final_errors(digest, errors)
             result = result.model_copy(update={
                 "status": RunStatus.PARTIAL if errors else RunStatus.SUCCESS,
+                "digest": digest,
                 "projection": projection_receipt,
                 "errors": errors,
             })
             store.finish_run(result)
+        # The initial report is durable evidence; this final overwrite carries
+        # final projection, delivery, and partial-run receipts without new I/O.
+        write_reports(digest, candidates, snapshots, all_events, errors, report_directory, run_result=result)
         return result
     finally:
         if projection_client is not None:

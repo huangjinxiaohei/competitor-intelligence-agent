@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Iterable
 
-from .models import Candidate, ChangeEvent, Digest, DigestProduct, ProductSnapshot
+from .models import Candidate, ChangeEvent, Digest, DigestProduct, ProductSnapshot, RunResult
 
 
 
@@ -98,6 +98,7 @@ def _markdown(
     snapshots: list[ProductSnapshot],
     changes: list[ChangeEvent],
     errors: list[str],
+    run_result: RunResult | None = None,
 ) -> str:
     lines = [f"# {digest.title}", "", digest.summary, "", "## \u53d8\u5316", ""]
     if changes:
@@ -134,6 +135,17 @@ def _markdown(
     )
     if errors:
         lines.extend(["", "## \u91c7\u96c6\u5931\u8d25", ""] + [f"- {error}" for error in errors])
+    if run_result is not None:
+        projection = run_result.projection
+        delivery = run_result.delivery
+        lines.extend(["", "## \u6700\u7ec8\u8fd0\u884c\u56de\u6267", ""])
+        lines.append(f"- \u72b6\u6001: {run_result.status.value}")
+        lines.append(f"- Base \u540c\u6b65: {'synced' if projection and projection.synced else 'pending'}")
+        if projection is not None:
+            lines.append(f"- Base outbox: {projection.outbox_pending}")
+        lines.append(f"- \u6d88\u606f\u53d1\u9001: {'sent' if delivery and delivery.delivered else 'not_sent'}")
+        if digest.base_links:
+            lines.append("- Base \u94fe\u63a5: " + _json(digest.base_links))
     return "\n".join(lines) + "\n"
 
 
@@ -144,6 +156,7 @@ def write_reports(
     changes: Iterable[ChangeEvent],
     errors: Iterable[str],
     reports_dir: str | Path,
+    run_result: RunResult | None = None,
 ) -> dict[str, Path]:
     """Write complete Markdown, JSON, and tabular snapshot/change exports."""
     directory = Path(reports_dir)
@@ -155,7 +168,7 @@ def write_reports(
     csv_path = directory / f"{digest.run_id}.csv"
 
     markdown_path.write_text(
-        _markdown(digest, candidate_list, snapshot_list, change_list, error_list),
+        _markdown(digest, candidate_list, snapshot_list, change_list, error_list, run_result),
         encoding="utf-8",
     )
     payload = {
@@ -164,6 +177,7 @@ def write_reports(
         "snapshots": [item.model_dump(mode="json") for item in snapshot_list],
         "changes": [item.model_dump(mode="json") for item in change_list],
         "errors": error_list,
+        **({"run_result": run_result.model_dump(mode="json")} if run_result is not None else {}),
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

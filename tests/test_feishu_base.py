@@ -11,6 +11,7 @@ from competitor_agent.feishu_base import (
     FeishuBaseClient,
     FeishuBaseError,
     FeishuBaseSetup,
+    TABLES,
 )
 from competitor_agent.storage import StateStore
 
@@ -66,6 +67,47 @@ def test_token_cache_and_refresh_before_expiry() -> None:
     assert service.tenant_token() == "tenant-second"
     assert calls == ["/open-apis/auth/v3/tenant_access_token/internal"] * 2
 
+
+
+def test_authentication_retries_429_and_5xx_then_exhausts() -> None:
+    attempts = 0
+    waits: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        assert request.url.path.endswith("tenant_access_token/internal")
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.4"})
+        if attempts == 2:
+            return httpx.Response(503)
+        return token_response()
+
+    assert client(handler, sleep=waits.append).tenant_token() == "tenant-secret-token"
+    assert attempts == 3
+    assert waits == [0.4, 2.0]
+
+    exhausted = 0
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        nonlocal exhausted
+        exhausted += 1
+        return httpx.Response(503)
+
+    with pytest.raises(FeishuBaseError, match="authentication failed"):
+        client(unavailable, sleep=lambda _: None).tenant_token()
+    assert exhausted == 4
+
+
+def test_owned_client_closes_without_closing_injected_client() -> None:
+    with FeishuBaseClient(app_id="id", app_secret="secret") as owned:
+        assert not owned._client.is_closed
+    assert owned._client.is_closed
+
+    injected = httpx.Client(transport=httpx.MockTransport(lambda _: token_response()), base_url=API)
+    FeishuBaseClient(app_id="id", app_secret="secret", client=injected).close()
+    assert not injected.is_closed
+    injected.close()
 
 def test_request_retries_rate_limit_and_redacts_failures() -> None:
     requests = []
@@ -139,6 +181,9 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
         if path.endswith("tenant_access_token/internal"):
             return token_response()
         if request.method == "POST" and path == "/open-apis/bitable/v1/apps":
+            tables.append({"table_id": "tbl-default", "name": "Default blank table"})
+            fields["tbl-default"] = []
+            views["tbl-default"] = []
             return response({"app": {"app_token": "app-test", "url": "https://feishu.cn/base/app-test"}})
         if path == "/open-apis/bitable/v1/apps/app-test/tables" and request.method == "GET":
             return response({"items": tables, "has_more": False})
@@ -149,6 +194,10 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
             fields[table_id] = []
             views[table_id] = []
             return response({"table_id": table_id})
+        if path == "/open-apis/bitable/v1/apps/app-test/tables/tbl-default" and request.method == "PATCH":
+            assert body == {"name": TABLES[0].name}
+            tables[0]["name"] = body["name"]
+            return response({"table": tables[0]})
         if path.endswith("/fields") and request.method == "GET":
             return response({"items": fields[path.split("/")[-2]], "has_more": False})
         if path.endswith("/fields") and request.method == "POST":
@@ -176,6 +225,7 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
     assert set(receipt.resource_links) >= {"竞品总览", "本周变化"}
     assert len(tables) == 4
     assert {item["name"] for item in tables} == {"竞品主表", "套餐价格表", "变化事件表", "运行日志表"}
+    assert sum(method == "POST" and path.endswith("/tables") for method, path, _ in created) == 3
     price_table = next(table["table_id"] for table in tables if table["name"] == "套餐价格表")
     link = next(field for field in fields[price_table] if field["field_name"] == "关联竞品")
     assert link["type"] == 21
@@ -184,7 +234,10 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
     assert all_views["竞品卡片"] == "gallery"
     assert all_views["高优先级变化"] == "kanban"
     permission_payloads = [body for _, path, body in created if "/permissions/app-test/members" in path]
-    assert {body["member_type"] for body in permission_payloads} == {"email", "chat_id"}
+    assert permission_payloads == [
+        {"member_type": "email", "member_id": "owner@example.com", "perm": "edit", "type": "user"},
+        {"member_type": "openchat", "member_id": "oc_chat", "perm": "view", "type": "chat"},
+    ]
     assert (tmp_path / "manifest.json").read_text(encoding="utf-8").startswith("{")
     assert store.get_projection_resource("base") == "app-test"
     field_count = sum(len(rows) for rows in fields.values())
@@ -193,7 +246,7 @@ def test_setup_creates_resources_relations_views_permissions_and_manifest(tmp_pa
     assert sum(len(rows) for rows in fields.values()) == field_count
     assert sum(len(rows) for rows in views.values()) == view_count
     assert sum(method == "POST" and path == "/open-apis/bitable/v1/apps" for method, path, _ in created) == 1
-    assert sum(method == "POST" and path.endswith("/tables") for method, path, _ in created) == 4
+    assert sum(method == "POST" and path.endswith("/tables") for method, path, _ in created) == 3
     assert not (tmp_path / "manifest.json").read_bytes().startswith(b"\xef\xbb\xbf")
     store.close()
 
@@ -213,6 +266,55 @@ def test_doctor_reports_live_bitable_scope_failure(tmp_path: Path) -> None:
     assert "scope" in result.checks["bitable_read"]
     store.close()
 
+
+
+def test_stale_sqlite_base_recovers_from_valid_manifest(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.url.path.endswith("/apps/app-stale/tables"):
+            return httpx.Response(404, json={"code": 1254040, "msg": "missing"})
+        if request.url.path.endswith("/apps/app-manifest/tables"):
+            return response({"items": [], "has_more": False})
+        raise AssertionError(request.url.path)
+
+    settings = config(tmp_path)
+    Path(settings.feishu_base.manifest_path).write_text(
+        json.dumps({"base": {"id": "app-manifest", "url": "https://feishu.cn/base/app-manifest"}}),
+        encoding="utf-8",
+    )
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.set_projection_resource("base", "app-stale", "https://feishu.cn/base/app-stale")
+    app_token, base_url, created, tables = FeishuBaseSetup(client(handler), settings, store)._ensure_base("ignored")
+    assert (app_token, base_url, created, tables) == (
+        "app-manifest", "https://feishu.cn/base/app-manifest", False, []
+    )
+    assert store.get_projection_resource("base") == "app-manifest"
+    store.close()
+
+
+def test_replay_never_renames_an_arbitrary_existing_table(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return token_response()
+        if request.method == "POST" and request.url.path.endswith("/tables"):
+            return response({"table_id": f"tbl-{len(calls)}"})
+        raise AssertionError(request.url.path)
+
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    table_ids = FeishuBaseSetup(client(handler), config(tmp_path), store)._ensure_tables(
+        "app-existing",
+        created_base=False,
+        existing_tables=[{"table_id": "tbl-arbitrary", "name": "Notes"}],
+    )
+    assert set(table_ids) == {"competitors", "pricing", "changes", "runs"}
+    assert not any(call.startswith("PATCH ") for call in calls)
+    store.close()
 
 def test_setup_replay_and_partial_recovery_reuses_persisted_resources(tmp_path: Path) -> None:
     # Stored Base and existing tables must be reused; only a missing table is created.

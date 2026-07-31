@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import re
 import time
 from typing import Any, Callable
 
@@ -26,8 +25,6 @@ _AUTH_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
 _API_ORIGIN = "https://open.feishu.cn"
 _TOKEN_REFRESH_SECONDS = 60
 _MAX_RETRIES = 3
-_URL_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
-_TOKEN_RE = re.compile(r"\b(?:t|u|a)-[A-Za-z0-9_-]{6,}\b")
 
 
 class FeishuBaseError(RuntimeError):
@@ -118,12 +115,6 @@ VIEWS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _redact(value: object) -> str:
-    """Remove bearer credentials and URLs from exception diagnostics."""
-    text = str(value)
-    text = _URL_RE.sub("[url]", text)
-    return _TOKEN_RE.sub("[token]", text)
-
 
 class FeishuBaseClient:
     """Small synchronous client covering setup and future projection writes."""
@@ -140,12 +131,24 @@ class FeishuBaseClient:
     ) -> None:
         self.app_id = app_id if app_id is not None else os.getenv("FEISHU_APP_ID", "")
         self.app_secret = app_secret if app_secret is not None else os.getenv("FEISHU_APP_SECRET", "")
+        self._owns_client = client is None
         self._client = client or httpx.Client(base_url=_API_ORIGIN, timeout=15.0)
         self._now = now
         self._sleep = sleep
         self._max_retries = max(0, max_retries)
         self._token: str | None = None
         self._token_expires_at = 0.0
+
+    def __enter__(self) -> FeishuBaseClient:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close only the HTTP client created by this adapter."""
+        if self._owns_client:
+            self._client.close()
 
     @property
     def has_credentials(self) -> bool:
@@ -156,14 +159,13 @@ class FeishuBaseClient:
             raise FeishuBaseError("Feishu credentials are not configured.")
         if self._token is not None and self._now() < self._token_expires_at - _TOKEN_REFRESH_SECONDS:
             return self._token
-        try:
-            response = self._client.post(
-                _AUTH_PATH,
-                json={"app_id": self.app_id, "app_secret": self.app_secret},
-                headers={"Content-Type": "application/json; charset=utf-8"},
-            )
-        except httpx.HTTPError as exc:
-            raise FeishuBaseError("Feishu authentication request failed.") from exc
+        response = self._send_with_retry(
+            "POST",
+            _AUTH_PATH,
+            json_body={"app_id": self.app_id, "app_secret": self.app_secret},
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            action="authentication",
+        )
         payload = self._response_payload(response, "authentication")
         token = payload.get("tenant_access_token")
         if not isinstance(token, str) or not token:
@@ -189,32 +191,25 @@ class FeishuBaseClient:
             raise FeishuBaseError(f"Feishu {action} returned an invalid data object.")
         return data
 
-    def request(
+    def _send_with_retry(
         self,
         method: str,
         path: str,
         *,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Call an authenticated OpenAPI endpoint with bounded transient retries."""
+        headers: dict[str, str] | None = None,
+        action: str,
+    ) -> httpx.Response:
+        """Send either auth or API requests with the same bounded transient policy."""
         for attempt in range(self._max_retries + 1):
             try:
-                response = self._client.request(
-                    method,
-                    path,
-                    json=json_body,
-                    params=params,
-                    headers={
-                        "Authorization": f"Bearer {self.tenant_token()}",
-                        "Content-Type": "application/json; charset=utf-8",
-                    },
-                )
+                response = self._client.request(method, path, json=json_body, params=params, headers=headers)
             except httpx.HTTPError as exc:
                 if attempt < self._max_retries:
                     self._sleep(min(2.0**attempt, 4.0))
                     continue
-                raise FeishuBaseError("Feishu request failed while contacting the API.") from exc
+                raise FeishuBaseError(f"Feishu {action} failed while contacting the API.") from exc
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < self._max_retries:
                     retry_after = response.headers.get("Retry-After")
@@ -224,8 +219,30 @@ class FeishuBaseClient:
                         delay = min(2.0**attempt, 4.0)
                     self._sleep(max(0.0, delay))
                     continue
-            return self._response_payload(response, "API request")
-        raise FeishuBaseError("Feishu request retry budget exhausted.")
+            return response
+        raise FeishuBaseError(f"Feishu {action} retry budget exhausted.")
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call an authenticated OpenAPI endpoint with bounded transient retries."""
+        response = self._send_with_retry(
+            method,
+            path,
+            json_body=json_body,
+            params=params,
+            headers={
+                "Authorization": f"Bearer {self.tenant_token()}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            action="API request",
+        )
+        return self._response_payload(response, "API request")
 
     def list_paginated(self, path: str, *, item_key: str = "items", params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -252,6 +269,14 @@ class FeishuBaseClient:
 
     def create_table(self, app_token: str, name: str) -> dict[str, Any]:
         return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables", json_body={"table": {"name": name}})
+
+    def rename_table(self, app_token: str, table_id: str, name: str) -> dict[str, Any]:
+        """Rename the single default table created with a new Base."""
+        return self.request(
+            "PATCH",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}",
+            json_body={"name": name},
+        )
 
     def list_fields(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
         return self.list_paginated(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
@@ -285,12 +310,25 @@ class FeishuBaseClient:
             raise ValueError("Feishu batch update accepts at most 200 records")
         return self.request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update", json_body={"records": records}).get("records", [])
 
-    def grant_permission(self, app_token: str, *, member_type: str, member_id: str, perm: str) -> dict[str, Any]:
+    def grant_permission(
+        self,
+        app_token: str,
+        *,
+        member_type: str,
+        member_id: str,
+        perm: str,
+        collaborator_type: str,
+    ) -> dict[str, Any]:
         return self.request(
             "POST",
             f"/open-apis/drive/v1/permissions/{app_token}/members",
             params={"type": "bitable"},
-            json_body={"member_type": member_type, "member_id": member_id, "perm": perm},
+            json_body={
+                "member_type": member_type,
+                "member_id": member_id,
+                "perm": perm,
+                "type": collaborator_type,
+            },
         )
 
 
@@ -349,30 +387,45 @@ class FeishuBaseSetup:
         settings = self.config.feishu_base
         if not settings.enabled:
             raise FeishuBaseError("Feishu Base projection is disabled in configuration.")
-        app_token, base_url = self._ensure_base(settings.base_name)
-        table_ids = self._ensure_tables(app_token)
+        app_token, base_url, created_base, existing_tables = self._ensure_base(settings.base_name)
+        table_ids = self._ensure_tables(app_token, created_base=created_base, existing_tables=existing_tables)
         self._ensure_fields(app_token, table_ids)
         view_links = self._ensure_views(app_token, table_ids, base_url)
         self._ensure_permissions(app_token)
         self._write_manifest(app_token, base_url, table_ids, view_links)
         return ProjectionReceipt(adapter="feishu-base", synced=True, base_url=base_url, resource_links=view_links, detail="Base schema is ready.")
 
-    def _ensure_base(self, name: str) -> tuple[str, str]:
+    def _ensure_base(self, name: str) -> tuple[str, str, bool, list[dict[str, Any]]]:
+        """Validate persisted resources before creation; never hide a stale Base by creating another."""
         assert self.store is not None
-        app_token = self.store.get_projection_resource("base")
-        base_url = self.store.get_projection_resource_link("base")
-        if not app_token:
-            app_token, base_url = self._load_manifest_base()
-        if not app_token:
-            data = self.client.create_base(name)
-            app = data.get("app", data)
-            app_token = app.get("app_token") if isinstance(app, dict) else None
-            if not isinstance(app_token, str) or not app_token:
-                raise FeishuBaseError("Feishu Base creation response did not contain app_token.")
-            base_url = app.get("url") if isinstance(app, dict) else None
+        sqlite_token = self.store.get_projection_resource("base")
+        sqlite_url = self.store.get_projection_resource_link("base")
+        manifest_token, manifest_url = self._load_manifest_base()
+        candidates: list[tuple[str, str | None]] = []
+        for candidate in ((sqlite_token, sqlite_url), (manifest_token, manifest_url)):
+            token, url = candidate
+            if isinstance(token, str) and token and token not in {item[0] for item in candidates}:
+                candidates.append((token, url if isinstance(url, str) else None))
+        if candidates:
+            for app_token, base_url in candidates:
+                try:
+                    existing_tables = self.client.list_tables(app_token)
+                except FeishuBaseError:
+                    continue
+                base_url = base_url or f"https://feishu.cn/base/{app_token}"
+                self.store.set_projection_resource("base", app_token, base_url)
+                return app_token, base_url, False, existing_tables
+            raise FeishuBaseError("Feishu Base recovery failed: persisted and manifest resources are unavailable.")
+        data = self.client.create_base(name)
+        app = data.get("app", data)
+        app_token = app.get("app_token") if isinstance(app, dict) else None
+        if not isinstance(app_token, str) or not app_token:
+            raise FeishuBaseError("Feishu Base creation response did not contain app_token.")
+        base_url = app.get("url") if isinstance(app, dict) else None
         base_url = base_url if isinstance(base_url, str) and base_url else f"https://feishu.cn/base/{app_token}"
+        existing_tables = self.client.list_tables(app_token)
         self.store.set_projection_resource("base", app_token, base_url)
-        return app_token, base_url
+        return app_token, base_url, True, existing_tables
 
     def _load_manifest_base(self) -> tuple[str | None, str | None]:
         assert self.config is not None and self.config.feishu_base is not None
@@ -386,11 +439,28 @@ class FeishuBaseSetup:
         base = data.get("base", {}) if isinstance(data, dict) else {}
         return (base.get("id"), base.get("url")) if isinstance(base, dict) else (None, None)
 
-    def _ensure_tables(self, app_token: str) -> dict[str, str]:
+    def _ensure_tables(
+        self,
+        app_token: str,
+        *,
+        created_base: bool,
+        existing_tables: list[dict[str, Any]],
+    ) -> dict[str, str]:
         assert self.store is not None
-        existing = self.client.list_tables(app_token)
-        by_name = {str(item.get("name")): str(item.get("table_id")) for item in existing if item.get("name") and item.get("table_id")}
-        known_ids = {str(item.get("table_id")) for item in existing if item.get("table_id")}
+        by_name = {
+            str(item.get("name")): str(item.get("table_id"))
+            for item in existing_tables
+            if item.get("name") and item.get("table_id")
+        }
+        # A just-created Base has exactly one empty default table.  Only in that
+        # creation path may it be renamed; replay never renames an arbitrary table.
+        competitors = TABLES[0]
+        if created_base and competitors.name not in by_name and len(existing_tables) == 1:
+            default_id = existing_tables[0].get("table_id")
+            if isinstance(default_id, str) and default_id:
+                self.client.rename_table(app_token, default_id, competitors.name)
+                by_name[competitors.name] = default_id
+        known_ids = {str(item.get("table_id")) for item in existing_tables if item.get("table_id")}
         table_ids: dict[str, str] = {}
         for spec in TABLES:
             stored = self.store.get_projection_resource(f"table:{spec.key}")
@@ -401,7 +471,11 @@ class FeishuBaseSetup:
             if not isinstance(table_id, str) or not table_id:
                 raise FeishuBaseError(f"Feishu did not return an ID for table {spec.key}.")
             table_ids[spec.key] = table_id
-            self.store.set_projection_resource(f"table:{spec.key}", table_id, f"https://feishu.cn/base/{app_token}?table={table_id}")
+            self.store.set_projection_resource(
+                f"table:{spec.key}",
+                table_id,
+                f"https://feishu.cn/base/{app_token}?table={table_id}",
+            )
         return table_ids
 
     def _ensure_fields(self, app_token: str, table_ids: dict[str, str]) -> None:
@@ -450,9 +524,21 @@ class FeishuBaseSetup:
 
     def _ensure_permissions(self, app_token: str) -> None:
         if self.owner_email:
-            self.client.grant_permission(app_token, member_type="email", member_id=self.owner_email, perm="edit")
+            self.client.grant_permission(
+                app_token,
+                member_type="email",
+                member_id=self.owner_email,
+                perm="edit",
+                collaborator_type="user",
+            )
         if self.viewer_chat_id:
-            self.client.grant_permission(app_token, member_type="chat_id", member_id=self.viewer_chat_id, perm="view")
+            self.client.grant_permission(
+                app_token,
+                member_type="openchat",
+                member_id=self.viewer_chat_id,
+                perm="view",
+                collaborator_type="chat",
+            )
 
     def _write_manifest(self, app_token: str, base_url: str, table_ids: dict[str, str], view_links: dict[str, str]) -> None:
         assert self.config is not None and self.config.feishu_base is not None
